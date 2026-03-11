@@ -9,3 +9,6 @@ target/
 .env*
 *secret*
 *credential*
+skiller-0.1.0-darwin-arm64.tar.gz.asc
+skiller-0.1.0-darwin-arm64.tar.gz
+skiller-0.1.0-darwin-arm64.tar.gz.sha256
