@@ -58,6 +58,7 @@ fn main() -> Result<()> {
         Cmd::Source { path } => {
             let expanded = PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).as_ref());
             anyhow::ensure!(expanded.exists(), "path does not exist: {}", expanded.display());
+            let expanded = expanded.canonicalize()?;
             // Validate contains at least one */SKILL.md
             let has_skill = std::fs::read_dir(&expanded)?
                 .filter_map(|e| e.ok())
