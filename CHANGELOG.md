@@ -3,6 +3,12 @@
 ### Features
 
 - Add built-in `hermes` target path for `~/.hermes/skills`
+- Show top-level help when `skiller` runs without a subcommand
+- Expand `target add --help` with built-in target types and path guidance
+
+### Docs
+
+- Add a `README.md` with a simple setup and usage example
 
 ### Bug Fixes
 

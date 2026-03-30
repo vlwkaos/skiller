@@ -3,7 +3,7 @@ mod link;
 mod targets;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 
 use config::Config;
@@ -11,10 +11,15 @@ use link::{cmd_link, cmd_status, cmd_unlink};
 use targets::{cmd_add, cmd_list, cmd_remove};
 
 #[derive(Parser)]
-#[command(name = "skiller", about = "Central skill management for AI coding tools")]
+#[command(
+    name = "skiller",
+    about = "Central skill management for AI coding tools",
+    after_help = "Examples:\n  skiller source ~/skills\n  skiller target add claude\n  skiller target add codex ~/.codex/skills\n  skiller link\n  skiller status",
+    arg_required_else_help = true
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -39,9 +44,14 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum TargetCmd {
-    /// Add a target (built-in types auto-resolve path)
+    #[command(
+        about = "Add a target",
+        long_about = "Add a target.\n\nBuilt-in types auto-resolve their default path when <TYPE> is one of:\n  claude\n  codex\n  opencode\n  openclaw\n  hermes\n\nPass <PATH> to override the built-in path or add a custom type."
+    )]
     Add {
+        #[arg(help = "Target type. Built-in types: claude, codex, opencode, openclaw, hermes")]
         r#type: String,
+        #[arg(help = "Optional explicit path. Omit it to use the built-in path for known types")]
         path: Option<String>,
     },
     /// Remove a target from config (does not unlink)
@@ -52,9 +62,14 @@ enum TargetCmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.command.is_none() {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    }
     let mut cfg = Config::load()?;
 
-    match cli.command {
+    match cli.command.expect("checked above") {
         Cmd::Source { path } => {
             let expanded = PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).as_ref());
             anyhow::ensure!(expanded.exists(), "path does not exist: {}", expanded.display());

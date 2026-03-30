@@ -5,6 +5,7 @@ edition = "2024"
 description = "Symlink manager for AI tool skill bundles"
 license = "MIT"
 repository = "https://github.com/vlwkaos/skiller"
+readme = "README.md"
 
 [[bin]]
 name = "skiller"
