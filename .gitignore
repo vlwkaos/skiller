@@ -13,3 +13,7 @@ skiller-0.1.0-darwin-arm64.tar.gz.asc
 skiller-0.1.0-darwin-arm64.tar.gz
 skiller-0.1.0-darwin-arm64.tar.gz.sha256
 *.bottle.tar.gz
+skiller-0.1.1-darwin-universal.tar.gz.asc
+skiller-0.1.1-darwin-universal.tar.gz
+skiller-0.1.1.all.bottle.tar.gz
+skiller-0.1.1-darwin-universal.tar.gz.sha256
