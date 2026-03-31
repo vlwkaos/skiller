@@ -1,3 +1,15 @@
+## [0.2.0] - 2026-03-31
+
+### Features
+
+- Add granular link mode — per-skill symlinks into a real target directory, allowing target-specific skills to coexist with shared ones ([`5e586fc`](https://github.com/vlwkaos/skiller/commit/5e586fc))
+- Add `hermes` built-in target path (`~/.hermes/skills`) ([`e49d5af`](https://github.com/vlwkaos/skiller/commit/e49d5af))
+- `skiller link [type]` and `skiller unlink [type]` now accept an optional target type to operate on a single target
+
+### Bug Fixes
+
+- Canonicalize source path on `skiller source` to prevent relative symlinks ([`f88a1ba`](https://github.com/vlwkaos/skiller/commit/f88a1ba))
+
 ## [0.1.1] - 2026-03-30
 
 ### Features
