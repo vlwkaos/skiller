@@ -1,3 +1,9 @@
+## [0.2.2] - 2026-04-02
+
+### Bug Fixes
+
+- Fix hermes built-in target path scoped to `skills/common` for proper skill scoping ([`623c20f`](https://github.com/vlwkaos/skiller/commit/623c20f))
+
 ## [0.2.0] - 2026-03-31
 
 ### Features
