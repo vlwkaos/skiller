@@ -11,7 +11,7 @@ pub fn builtin_paths() -> HashMap<&'static str, PathBuf> {
         ("codex", home.join(".codex/skills")),
         ("opencode", home.join(".config/opencode/skills")),
         ("openclaw", home.join(".openclaw/skills")),
-        ("hermes", home.join(".hermes/skills")),
+        ("hermes", home.join(".hermes/skills/common")),
     ])
 }
 
