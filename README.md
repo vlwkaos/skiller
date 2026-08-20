@@ -12,6 +12,8 @@ skiller config -g [--print] [--set catalog/name=enable|manual|off]
 skiller install -g [--migrate]
 ```
 
+Interactive `config` opens a scoped terminal UI: arrows navigate, Space cycles Agent + Human, Human, and Off, `i` toggles project Git-ignore state, and `s` or Enter saves. Escape or `q` cancels without writing.
+
 `--print` emits machine-readable catalog, selection, dependency, and installed state without prompting or changing configuration/installation state; remote catalog refresh may update Skiller's cache. `--set` applies one or more validated selections without installing, so a frontend can save once and then run `skiller install`. `--migrate` adopts same-name legacy installations only after every selected source stages successfully. Unrelated skills remain untouched.
 
 ## Configuration

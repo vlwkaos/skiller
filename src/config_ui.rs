@@ -15,19 +15,19 @@ use crate::paths::{
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConfigRow {
-    key: String,
-    catalog: String,
-    scope: String,
-    scope_order: i32,
-    name: String,
-    installed_name: String,
-    description: String,
-    global: bool,
-    selected: Option<SelectionMode>,
-    gitignore: bool,
-    installed: bool,
-    required_by: Vec<String>,
+pub(crate) struct ConfigRow {
+    pub(crate) key: String,
+    pub(crate) catalog: String,
+    pub(crate) scope: String,
+    pub(crate) scope_order: i32,
+    pub(crate) name: String,
+    pub(crate) installed_name: String,
+    pub(crate) description: String,
+    pub(crate) global: bool,
+    pub(crate) selected: Option<SelectionMode>,
+    pub(crate) gitignore: bool,
+    pub(crate) installed: bool,
+    pub(crate) required_by: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -96,63 +96,12 @@ pub fn configure(scope: InstallScope, print_only: bool, assignments: &[String]) 
         return Ok(());
     }
 
-    let original = manifest.clone();
-    loop {
-        render(&rows, &manifest, scope.is_global());
-        if scope.is_global() {
-            print!("toggle <number>, save, or quit: ");
-        } else {
-            print!("toggle <number>, ignore <number>, save, or quit: ");
-        }
-        io::stdout().flush()?;
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input)? == 0 {
-            return Ok(());
-        }
-        let input = input.trim();
-        if let Some(number) = command_number(input, "toggle").or_else(|| input.parse().ok()) {
-            if let Some(row) = rows.get(number.saturating_sub(1)) {
-                cycle_selection(&mut manifest, &row.key);
-            } else {
-                println!("unknown row: {number}");
-            }
-            continue;
-        }
-        if let Some(number) = command_number(input, "ignore") {
-            if scope.is_global() {
-                println!("global skills do not have project Git ignore state");
-            } else if let Some(row) = rows.get(number.saturating_sub(1)) {
-                toggle_gitignore(&mut manifest, &row.key);
-            } else {
-                println!("unknown row: {number}");
-            }
-            continue;
-        }
-        match input {
-            "s" | "save" => {
-                save_manifest(&scope, &config_path, &manifest, &mut global_config)?;
-                println!("saved {}", config_path.display());
-                maybe_install(scope.clone(), &manifest, &catalogs)?;
-                return Ok(());
-            }
-            "q" | "quit" => {
-                if manifest != original {
-                    match prompt("Save changes? [y/N/cancel]: ")?.as_str() {
-                        "y" | "yes" => {
-                            save_manifest(&scope, &config_path, &manifest, &mut global_config)?;
-                            println!("saved {}", config_path.display());
-                        }
-                        "c" | "cancel" => continue,
-                        _ => {}
-                    }
-                }
-                maybe_install(scope.clone(), &manifest, &catalogs)?;
-                return Ok(());
-            }
-            _ if scope.is_global() => {
-                println!("use a row number, `save`, or `quit`");
-            }
-            _ => println!("use a row number, `ignore <number>`, `save`, or `quit`"),
+    match crate::config_tui::run(&rows, &mut manifest, scope.is_global())? {
+        crate::config_tui::ConfigTuiResult::Cancel => Ok(()),
+        crate::config_tui::ConfigTuiResult::Save => {
+            save_manifest(&scope, &config_path, &manifest, &mut global_config)?;
+            println!("saved {}", config_path.display());
+            maybe_install(scope, &manifest, &catalogs)
         }
     }
 }
@@ -239,55 +188,6 @@ fn config_rows(
     rows
 }
 
-fn render(rows: &[ConfigRow], manifest: &ProjectConfig, global_scope: bool) {
-    println!();
-    println!(
-        "{} catalog skills",
-        if global_scope { "Global" } else { "Project" }
-    );
-    let mut previous_group: Option<(&str, &str)> = None;
-    for (index, row) in rows.iter().enumerate() {
-        let group = (row.catalog.as_str(), row.scope.as_str());
-        if previous_group != Some(group) {
-            println!("\n{} / {}", row.catalog, row.scope);
-            previous_group = Some(group);
-        }
-        let (mode, ignored) = manifest
-            .skills
-            .get(&row.key)
-            .map(|selection| {
-                (
-                    match selection.mode() {
-                        SelectionMode::Enable => "enable",
-                        SelectionMode::Manual => "manual",
-                    },
-                    selection.gitignore(),
-                )
-            })
-            .unwrap_or(("unselected", false));
-        let installed = if row.installed {
-            "installed"
-        } else {
-            "not installed"
-        };
-        let ignored = if ignored { ", ignored" } else { "" };
-        println!(
-            "{:>3}. [{mode}] {} -> {} ({installed}{ignored})\n     {}",
-            index + 1,
-            row.name,
-            row.installed_name,
-            row.description
-        );
-    }
-    if rows.is_empty() {
-        println!(
-            "No {} catalog skills are available.",
-            if global_scope { "global" } else { "project" }
-        );
-    }
-    println!();
-}
-
 fn apply_assignments(
     manifest: &mut ProjectConfig,
     rows: &[ConfigRow],
@@ -327,7 +227,7 @@ fn apply_assignments(
     Ok(())
 }
 
-fn cycle_selection(manifest: &mut ProjectConfig, key: &str) {
+pub(crate) fn cycle_selection(manifest: &mut ProjectConfig, key: &str) {
     let next = match manifest.skills.get(key).map(SkillSelection::mode) {
         None => Some(SelectionMode::Enable),
         Some(SelectionMode::Enable) => Some(SelectionMode::Manual),
@@ -346,7 +246,7 @@ fn cycle_selection(manifest: &mut ProjectConfig, key: &str) {
     }
 }
 
-fn toggle_gitignore(manifest: &mut ProjectConfig, key: &str) {
+pub(crate) fn toggle_gitignore(manifest: &mut ProjectConfig, key: &str) {
     let Some(selection) = manifest.skills.get(key) else {
         println!("select the skill before changing its Git ignore state");
         return;
@@ -356,13 +256,6 @@ fn toggle_gitignore(manifest: &mut ProjectConfig, key: &str) {
     manifest
         .skills
         .insert(key.to_owned(), SkillSelection::from_parts(mode, ignored));
-}
-
-fn command_number(input: &str, command: &str) -> Option<usize> {
-    let mut parts = input.split_whitespace();
-    (parts.next()? == command)
-        .then(|| parts.next()?.parse().ok())
-        .flatten()
 }
 
 fn maybe_install(

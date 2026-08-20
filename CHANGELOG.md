@@ -1,7 +1,8 @@
-## [0.1.2] - 2026-08-20
+## [0.2.0] - 2026-08-20
 
 ### Features
 
+- Replace numbered interactive configuration with a scoped, keyboard-driven terminal UI.
 - Add bounded noninteractive `config --set catalog/name=enable|manual|off` updates for trusted configuration frontends.
 
 ## [0.1.1] - 2026-08-20

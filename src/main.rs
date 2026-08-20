@@ -1,4 +1,5 @@
 mod catalog;
+mod config_tui;
 mod config_ui;
 mod installer;
 mod manual;

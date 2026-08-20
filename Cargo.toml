@@ -1,6 +1,6 @@
 [package]
 name = "skiller"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "Declarative project and global skill management over the Vercel Skills CLI"
 license = "MIT"
@@ -14,5 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "=1.0.102"
 clap = { version = "=4.5.60", features = ["derive"] }
+crossterm = "=0.29.0"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.149"
+unicode-width = "=0.2.2"
