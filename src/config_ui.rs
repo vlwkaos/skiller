@@ -124,6 +124,10 @@ fn save_manifest(
     }
 }
 
+fn installed_name_is_current(installed: &crate::model::InstalledSkill, desired_name: &str) -> bool {
+    installed.installed_name == desired_name
+}
+
 fn config_rows(
     catalogs: &BTreeMap<String, CatalogIndex>,
     state: &InstalledState,
@@ -156,7 +160,7 @@ fn config_rows(
                         .collect();
                     required_by.sort();
                     let installed = state.skills.get(&key).filter(|installed| {
-                        installed.installed_name == installed_name
+                        installed_name_is_current(installed, &installed_name)
                             && target_root
                                 .join(&installed.installed_name)
                                 .join("SKILL.md")
@@ -291,7 +295,7 @@ fn prompt(message: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::catalog::CatalogSkill;
-    use crate::model::{CatalogMetadata, SCHEMA_VERSION};
+    use crate::model::{CatalogMetadata, InstalledSkill, SCHEMA_VERSION};
     use std::path::PathBuf;
 
     #[test]
@@ -346,6 +350,23 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn stale_unpostfixed_state_does_not_match_a_postfixed_row() {
+        let installed = InstalledSkill {
+            catalog: "pyg".to_owned(),
+            source_skill: "develop".to_owned(),
+            installed_name: "develop".to_owned(),
+            path: ".agents/skills/develop".to_owned(),
+            mode: EffectiveMode::Enable,
+            gitignore: false,
+        };
+        assert!(!installed_name_is_current(
+            &installed,
+            "develop-engineering"
+        ));
+        assert!(installed_name_is_current(&installed, "develop"));
     }
 
     #[test]
