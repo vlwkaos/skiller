@@ -1,0 +1,19 @@
+/target/
+/.work/
+
+# Release artifacts
+*.asc
+*.bottle.tar.gz
+*.sha256
+*.tar.gz
+
+# Secrets
+.env*
+*.key
+*.p12
+*.pem
+*.pfx
+*credential*
+*secret*
+secrets/
+.secrets

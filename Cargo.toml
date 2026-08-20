@@ -1,0 +1,18 @@
+[package]
+name = "skiller"
+version = "0.1.0"
+edition = "2024"
+description = "Declarative project and global skill management over the Vercel Skills CLI"
+license = "MIT"
+repository = "https://github.com/vlwkaos/skiller"
+readme = "README.md"
+
+[[bin]]
+name = "skiller"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "=1.0.102"
+clap = { version = "=4.5.60", features = ["derive"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
