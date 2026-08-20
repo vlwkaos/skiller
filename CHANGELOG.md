@@ -1,3 +1,14 @@
+## [0.4.0] - 2026-08-21
+
+### Features
+
+- Add explicit `catalog add-skill --global|--project` authoring with bounded copy, metadata validation, dependency checks, and rollback.
+- Add project-only noninteractive Git-ignore updates for configuration frontends.
+
+### Fixed
+
+- Preserve existing project Git-ignore state when changing a skill mode through `config --set`.
+
 ## [0.3.0] - 2026-08-20
 
 ### Changed

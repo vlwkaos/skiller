@@ -5,11 +5,12 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::model::{
-    CatalogMetadata, CatalogRegistration, GlobalConfig, valid_name, validate_alias, validate_schema,
+    CatalogMetadata, CatalogRegistration, CatalogSkillMetadata, GlobalConfig, valid_name,
+    validate_alias, validate_schema,
 };
 use crate::paths::{
-    cache_root, global_config_path, read_json, read_json_or_default, safe_remove_owned_dir,
-    sanitize_child_output, write_global_config,
+    cache_root, copy_tree, ensure_real_dir, global_config_path, read_json, read_json_or_default,
+    safe_remove_owned_dir, sanitize_child_output, write_global_config, write_json_atomic,
 };
 
 #[derive(Debug, Clone)]
@@ -29,6 +30,12 @@ pub struct CatalogSkill {
     pub installed_name: String,
     pub global: bool,
     pub requires: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogEligibility {
+    Global,
+    Project,
 }
 
 pub fn load_global_config() -> Result<GlobalConfig> {
@@ -59,6 +66,133 @@ pub fn add_catalog(alias: &str, source: &str) -> Result<()> {
         "added catalog {alias}: {} skill{} from {source}",
         index.skills.len(),
         if index.skills.len() == 1 { "" } else { "s" }
+    );
+    Ok(())
+}
+
+// ^ README.md#catalog-authoring owns the explicit checkout and eligibility boundary.
+pub fn add_skill(
+    catalog_root: &Path,
+    source: &Path,
+    scope: &str,
+    eligibility: CatalogEligibility,
+) -> Result<()> {
+    for (kind, path) in [("catalog root", catalog_root), ("skill source", source)] {
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("inspecting {kind} {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("{kind} must be a real directory: {}", path.display());
+        }
+    }
+    let root = catalog_root
+        .canonicalize()
+        .with_context(|| format!("resolving catalog root {}", catalog_root.display()))?;
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("resolving skill source {}", source.display()))?;
+    if source.starts_with(&root) {
+        bail!(
+            "skill source must be outside the target catalog: {}",
+            source.display()
+        );
+    }
+    if !valid_name(scope) {
+        bail!("invalid catalog scope: {scope}");
+    }
+
+    let metadata_path = root.join("skiller.json");
+    let metadata_file = std::fs::symlink_metadata(&metadata_path)
+        .with_context(|| format!("inspecting {}", metadata_path.display()))?;
+    if metadata_file.file_type().is_symlink() || !metadata_file.is_file() {
+        bail!(
+            "catalog metadata must be a real file: {}",
+            metadata_path.display()
+        );
+    }
+    let mut metadata: CatalogMetadata = read_json(&metadata_path)?;
+    validate_schema(metadata.version, "catalog metadata")?;
+    if !metadata.scopes.contains_key(scope) {
+        bail!("catalog has no scope named {scope}");
+    }
+    let current = scan_catalog("authoring", &root.display().to_string(), &root)?;
+    let skill = read_skill_directory(
+        &source,
+        CatalogSkillMetadata {
+            scope: Some(scope.to_owned()),
+            global: eligibility == CatalogEligibility::Global,
+        },
+    )?;
+    if current.skills.contains_key(&skill.name) || metadata.skills.contains_key(&skill.name) {
+        bail!("catalog already contains skill: {}", skill.name);
+    }
+    for dependency in &skill.requires {
+        let required = current
+            .skills
+            .get(dependency)
+            .with_context(|| format!("skill {} has invalid dependency {dependency}", skill.name))?;
+        if eligibility == CatalogEligibility::Global && !required.global {
+            bail!(
+                "global skill {} requires project-only skill {dependency}; mark its dependency closure global",
+                skill.name
+            );
+        }
+    }
+
+    let skills_root = root.join("skills");
+    ensure_real_dir(&skills_root)?;
+    let destination = skills_root.join(&skill.name);
+    if destination.exists() {
+        bail!(
+            "catalog skill destination already exists: {}",
+            destination.display()
+        );
+    }
+    let staging = root.join(format!(
+        ".skiller-add-{}-{}",
+        std::process::id(),
+        skill.name
+    ));
+    if staging.exists() {
+        bail!(
+            "catalog add staging path already exists: {}",
+            staging.display()
+        );
+    }
+
+    if let Err(error) = copy_tree(&source, &staging) {
+        let _ = safe_remove_owned_dir(&staging, &root);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&staging, &destination) {
+        let _ = safe_remove_owned_dir(&staging, &root);
+        return Err(error).with_context(|| format!("committing {}", destination.display()));
+    }
+
+    metadata.skills.insert(
+        skill.name.clone(),
+        CatalogSkillMetadata {
+            scope: Some(scope.to_owned()),
+            global: eligibility == CatalogEligibility::Global,
+        },
+    );
+    if let Err(error) = write_json_atomic(&metadata_path, &metadata) {
+        let cleanup = safe_remove_owned_dir(&destination, &skills_root);
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "catalog metadata write failed and cleanup also failed: {cleanup:#}"
+            ))),
+        };
+    }
+
+    println!(
+        "added {} as {} skill in scope {scope}",
+        skill.name,
+        if eligibility == CatalogEligibility::Global {
+            "global"
+        } else {
+            "project"
+        }
     );
     Ok(())
 }
@@ -155,52 +289,25 @@ fn scan_catalog(alias: &str, source: &str, root: &Path) -> Result<CatalogIndex> 
         if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
-        let directory_name = entry.file_name().to_string_lossy().into_owned();
-        let skill_path = entry.path().join("SKILL.md");
-        if !skill_path.is_file() {
+        let path = entry.path();
+        if !path.join("SKILL.md").is_file() {
             continue;
         }
-        let raw = std::fs::read_to_string(&skill_path)
-            .with_context(|| format!("reading {}", skill_path.display()))?;
-        let frontmatter = frontmatter(&raw, &skill_path)?;
-        let name = scalar(frontmatter, "name").unwrap_or_else(|| directory_name.clone());
-        if name != directory_name || !valid_name(&name) {
-            bail!(
-                "Agent Skills requires a valid name matching its folder: {}",
-                skill_path.display()
-            );
-        }
-        let description =
-            scalar(frontmatter, "description").unwrap_or_else(|| "No description".to_owned());
-        let skill_metadata = metadata.skills.get(&name).cloned().unwrap_or_default();
-        let scope = skill_metadata.scope;
-        if let Some(scope) = &scope
+        let directory_name = entry.file_name().to_string_lossy().into_owned();
+        let skill = read_skill_directory(
+            &path,
+            metadata
+                .skills
+                .get(&directory_name)
+                .cloned()
+                .unwrap_or_default(),
+        )?;
+        if let Some(scope) = &skill.scope
             && !metadata.scopes.contains_key(scope)
         {
-            bail!("skill {name} references unknown scope {scope}");
+            bail!("skill {} references unknown scope {scope}", skill.name);
         }
-        let requires = nested_scalar(frontmatter, "skiller.requires")
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|dependency| !dependency.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let installed_name = installed_name(&name, scope.as_deref())?;
-        skills.insert(
-            name.clone(),
-            CatalogSkill {
-                name,
-                description,
-                scope,
-                installed_name,
-                global: skill_metadata.global,
-                requires,
-            },
-        );
+        skills.insert(skill.name.clone(), skill);
     }
     if skills.is_empty() {
         bail!(
@@ -220,6 +327,45 @@ fn scan_catalog(alias: &str, source: &str, root: &Path) -> Result<CatalogIndex> 
         root: root.to_owned(),
         metadata,
         skills,
+    })
+}
+
+fn read_skill_directory(directory: &Path, metadata: CatalogSkillMetadata) -> Result<CatalogSkill> {
+    let skill_path = directory.join("SKILL.md");
+    let raw = std::fs::read_to_string(&skill_path)
+        .with_context(|| format!("reading {}", skill_path.display()))?;
+    let frontmatter = frontmatter(&raw, &skill_path)?;
+    let folder_name = directory
+        .file_name()
+        .context("skill directory has no name")?
+        .to_string_lossy()
+        .into_owned();
+    let name = scalar(frontmatter, "name").unwrap_or_else(|| folder_name.clone());
+    if name != folder_name || !valid_name(&name) {
+        bail!(
+            "Agent Skills requires a valid name matching its folder: {}",
+            skill_path.display()
+        );
+    }
+    let description =
+        scalar(frontmatter, "description").unwrap_or_else(|| "No description".to_owned());
+    let requires = nested_scalar(frontmatter, "skiller.requires")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|dependency| !dependency.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(CatalogSkill {
+        installed_name: installed_name(&name, metadata.scope.as_deref())?,
+        name,
+        description,
+        scope: metadata.scope,
+        global: metadata.global,
+        requires,
     })
 }
 
@@ -405,5 +551,132 @@ mod tests {
             validate_dependencies(&indirect).unwrap_err().to_string(),
             "catalog dependency cycle: a -> b -> c -> a"
         );
+    }
+
+    #[test]
+    fn add_skill_requires_explicit_scope_and_preserves_global_closure() {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/catalog-add-skill");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("catalog");
+        let source = base.join("candidate/learn");
+        std::fs::create_dir_all(root.join("skills/note")).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            root.join("skiller.json"),
+            r#"{"version":1,"scopes":{"knowledge":{"order":10},"learning":{"order":20}},"skills":{"note":{"scope":"knowledge","global":true}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("skills/note/SKILL.md"),
+            "---\nname: note\ndescription: Save notes\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: learn\ndescription: Teach deeply\nmetadata:\n  skiller.requires: note\n---\n",
+        )
+        .unwrap();
+
+        add_skill(&root, &source, "learning", CatalogEligibility::Global).unwrap();
+        assert!(root.join("skills/learn/SKILL.md").is_file());
+        let metadata: CatalogMetadata = read_json(&root.join("skiller.json")).unwrap();
+        assert_eq!(
+            metadata.skills["learn"],
+            CatalogSkillMetadata {
+                scope: Some("learning".to_owned()),
+                global: true,
+            }
+        );
+        assert!(
+            add_skill(&root, &source, "missing", CatalogEligibility::Project)
+                .unwrap_err()
+                .to_string()
+                .contains("no scope")
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn add_skill_rejects_project_only_global_dependencies_without_mutation() {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/catalog-add-project-dependency");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("catalog");
+        let source = base.join("candidate/root");
+        std::fs::create_dir_all(root.join("skills/helper")).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            root.join("skiller.json"),
+            r#"{"version":1,"scopes":{"test":{"order":10}},"skills":{"helper":{"scope":"test","global":false}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("skills/helper/SKILL.md"),
+            "---\nname: helper\ndescription: Project helper\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: root\ndescription: Global root\nmetadata:\n  skiller.requires: helper\n---\n",
+        )
+        .unwrap();
+
+        let error = add_skill(&root, &source, "test", CatalogEligibility::Global)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("project-only skill helper"));
+        assert!(!root.join("skills/root").exists());
+        let metadata: CatalogMetadata = read_json(&root.join("skiller.json")).unwrap();
+        assert!(!metadata.skills.contains_key("root"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_skill_rejects_nested_symlinks_and_cleans_staging() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/catalog-add-symlink");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("catalog");
+        let source = base.join("candidate/root");
+        std::fs::create_dir_all(root.join("skills/helper")).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            root.join("skiller.json"),
+            r#"{"version":1,"scopes":{"test":{"order":10}},"skills":{"helper":{"scope":"test","global":true}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("skills/helper/SKILL.md"),
+            "---\nname: helper\ndescription: Helper\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: root\ndescription: Root\nmetadata:\n  skiller.requires: helper\n---\n",
+        )
+        .unwrap();
+        std::fs::write(base.join("outside.txt"), "outside").unwrap();
+        symlink(base.join("outside.txt"), source.join("escape")).unwrap();
+
+        let error = add_skill(&root, &source, "test", CatalogEligibility::Global)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported symlink"));
+        assert!(!root.join("skills/root").exists());
+        assert!(
+            !root
+                .join(format!(".skiller-add-{}-root", std::process::id()))
+                .exists()
+        );
+        let metadata: CatalogMetadata = read_json(&root.join("skiller.json")).unwrap();
+        assert!(!metadata.skills.contains_key("root"));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

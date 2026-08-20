@@ -6,7 +6,8 @@
 
 ```bash
 skiller add-catalog pyg vlwkaos/skills
-skiller config [--print] [--set catalog/name=enable|manual|off]
+skiller catalog add-skill --root <catalog> --source <skill> --scope <scope> --global|--project
+skiller config [--print] [--set catalog/name=enable|manual|off] [--set-gitignore catalog/name=true|false]
 skiller install [--migrate]
 skiller config -g [--print] [--set catalog/name=enable|manual|off]
 skiller install -g [--migrate]
@@ -14,7 +15,7 @@ skiller install -g [--migrate]
 
 Interactive `config` opens a scoped terminal UI: arrows navigate, Space cycles Agent + Human, Human, and Off, `i` toggles project Git-ignore state, and `s` or Enter saves. Escape or `q` cancels without writing.
 
-`--print` emits machine-readable catalog, selection, dependency, and installed state without prompting or changing configuration/installation state; remote catalog refresh may update Skiller's cache. `--set` applies one or more validated selections without installing, so a frontend can save once and then run `skiller install`. `--migrate` adopts same-name legacy installations only after every selected source stages successfully. Unrelated skills remain untouched.
+`--print` emits machine-readable catalog, selection, dependency, and installed state without prompting or changing configuration/installation state; remote catalog refresh may update Skiller's cache. `--set` applies one or more validated selections without installing and preserves existing project Git-ignore state. Project-only `--set-gitignore` updates that state for selected skills. A frontend can save once and then run `skiller install`. `--migrate` adopts same-name legacy installations only after every selected source stages successfully. Unrelated skills remain untouched.
 
 ## Configuration
 
@@ -81,6 +82,10 @@ skiller.json
 ```
 
 Global configuration shows only `global: true` skills. Project configuration shows only project skills. Global and project installations receive their display-scope postfix, such as `develop-engineering`. The postfix keeps semantic scope portable across native agent command surfaces.
+
+### Catalog authoring
+
+`catalog add-skill` copies one external skill directory into one explicit writable catalog checkout and registers its existing scope. Exactly one of `--global` or `--project` is required. The command never discovers an authoring checkout, commits, pushes, deletes a source, or infers company ownership. It rejects symlinked content, duplicate or invalid names, unknown scopes, missing dependencies, and a global skill whose dependency closure includes project-only skills.
 
 Dependencies use a comma-separated string in `metadata.skiller.requires`. Missing targets and direct or transitive cycles fail catalog loading with the complete cycle path. Global dependency closure must also be global.
 

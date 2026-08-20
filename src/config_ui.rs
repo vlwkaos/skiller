@@ -41,7 +41,12 @@ struct PrintedConfig<'a> {
     skills: &'a [ConfigRow],
 }
 
-pub fn configure(scope: InstallScope, print_only: bool, assignments: &[String]) -> Result<()> {
+pub fn configure(
+    scope: InstallScope,
+    print_only: bool,
+    assignments: &[String],
+    gitignore_assignments: &[String],
+) -> Result<()> {
     let mut global_config = load_global_config()?;
     if global_config.catalogs.is_empty() {
         anyhow::bail!("no catalogs configured; run `skiller add-catalog <alias> <source>`");
@@ -92,8 +97,14 @@ pub fn configure(scope: InstallScope, print_only: bool, assignments: &[String]) 
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
-    if !assignments.is_empty() {
+    if !assignments.is_empty() || !gitignore_assignments.is_empty() {
         apply_assignments(&mut manifest, &rows, assignments)?;
+        apply_gitignore_assignments(
+            &mut manifest,
+            &rows,
+            gitignore_assignments,
+            scope.is_global(),
+        )?;
         save_manifest(&scope, &config_path, &manifest, &mut global_config)?;
         println!("saved {}", config_path.display());
         return Ok(());
@@ -211,17 +222,21 @@ fn apply_assignments(
         if !seen.insert(key) {
             anyhow::bail!("duplicate skill selection: {key}");
         }
+        let gitignore = manifest
+            .skills
+            .get(key)
+            .is_some_and(SkillSelection::gitignore);
         match mode {
             "enable" => {
                 manifest.skills.insert(
                     key.to_owned(),
-                    SkillSelection::from_parts(SelectionMode::Enable, false),
+                    SkillSelection::from_parts(SelectionMode::Enable, gitignore),
                 );
             }
             "manual" => {
                 manifest.skills.insert(
                     key.to_owned(),
-                    SkillSelection::from_parts(SelectionMode::Manual, false),
+                    SkillSelection::from_parts(SelectionMode::Manual, gitignore),
                 );
             }
             "off" => {
@@ -229,6 +244,46 @@ fn apply_assignments(
             }
             _ => anyhow::bail!("invalid mode for {key}: {mode}; expected enable, manual, or off"),
         }
+    }
+    Ok(())
+}
+
+fn apply_gitignore_assignments(
+    manifest: &mut ProjectConfig,
+    rows: &[ConfigRow],
+    assignments: &[String],
+    global_scope: bool,
+) -> Result<()> {
+    if global_scope && !assignments.is_empty() {
+        anyhow::bail!("global skill configuration does not support Git ignore state");
+    }
+    let available: BTreeSet<_> = rows.iter().map(|row| row.key.as_str()).collect();
+    let mut seen = BTreeSet::new();
+    for assignment in assignments {
+        let (key, value) = assignment.split_once('=').with_context(|| {
+            format!("invalid Git ignore state {assignment:?}; expected catalog/name=true|false")
+        })?;
+        if !available.contains(key) {
+            anyhow::bail!("skill is unavailable in this configuration: {key}");
+        }
+        if !seen.insert(key) {
+            anyhow::bail!("duplicate Git ignore state: {key}");
+        }
+        let gitignore = match value {
+            "true" => true,
+            "false" => false,
+            _ => {
+                anyhow::bail!("invalid Git ignore state for {key}: {value}; expected true or false")
+            }
+        };
+        let selection = manifest
+            .skills
+            .get(key)
+            .with_context(|| format!("select {key} before changing its Git ignore state"))?;
+        manifest.skills.insert(
+            key.to_owned(),
+            SkillSelection::from_parts(selection.mode(), gitignore),
+        );
     }
     Ok(())
 }
@@ -332,8 +387,16 @@ mod tests {
         let mut manifest = ProjectConfig::default();
         apply_assignments(&mut manifest, &rows, &["pyg/develop=enable".to_owned()]).unwrap();
         assert_eq!(manifest.skills["pyg/develop"].mode(), SelectionMode::Enable);
+        apply_gitignore_assignments(
+            &mut manifest,
+            &rows,
+            &["pyg/develop=true".to_owned()],
+            false,
+        )
+        .unwrap();
         apply_assignments(&mut manifest, &rows, &["pyg/develop=manual".to_owned()]).unwrap();
         assert_eq!(manifest.skills["pyg/develop"].mode(), SelectionMode::Manual);
+        assert!(manifest.skills["pyg/develop"].gitignore());
         apply_assignments(&mut manifest, &rows, &["pyg/develop=off".to_owned()]).unwrap();
         assert!(!manifest.skills.contains_key("pyg/develop"));
         assert!(
@@ -347,6 +410,24 @@ mod tests {
                     "pyg/develop=enable".to_owned(),
                     "pyg/develop=manual".to_owned()
                 ]
+            )
+            .is_err()
+        );
+        assert!(
+            apply_gitignore_assignments(
+                &mut manifest,
+                &rows,
+                &["pyg/develop=true".to_owned()],
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            apply_gitignore_assignments(
+                &mut ProjectConfig::default(),
+                &rows,
+                &["pyg/develop=true".to_owned()],
+                false,
             )
             .is_err()
         );
