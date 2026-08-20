@@ -298,7 +298,7 @@ fn scalar_value(lines: &[&str], index: usize, value: &str) -> Option<String> {
 fn validate_dependencies(skills: &BTreeMap<String, CatalogSkill>) -> Result<()> {
     for skill in skills.values() {
         for dependency in &skill.requires {
-            if dependency == &skill.name || !skills.contains_key(dependency) {
+            if !skills.contains_key(dependency) {
                 bail!("skill {} has invalid dependency {dependency}", skill.name);
             }
         }
@@ -371,6 +371,39 @@ mod tests {
         assert_eq!(
             scalar(frontmatter, "description").as_deref(),
             Some("Load project context before planning. Skip literal lookups.")
+        );
+    }
+
+    fn dependency_skill(name: &str, requires: &[&str]) -> CatalogSkill {
+        CatalogSkill {
+            name: name.to_owned(),
+            description: name.to_owned(),
+            scope: None,
+            installed_name: name.to_owned(),
+            global: true,
+            requires: requires
+                .iter()
+                .map(|dependency| (*dependency).to_owned())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn dependency_cycles_report_the_complete_path() {
+        let direct = BTreeMap::from([("a".to_owned(), dependency_skill("a", &["a"]))]);
+        assert_eq!(
+            validate_dependencies(&direct).unwrap_err().to_string(),
+            "catalog dependency cycle: a -> a"
+        );
+
+        let indirect = BTreeMap::from([
+            ("a".to_owned(), dependency_skill("a", &["b"])),
+            ("b".to_owned(), dependency_skill("b", &["c"])),
+            ("c".to_owned(), dependency_skill("c", &["a"])),
+        ]);
+        assert_eq!(
+            validate_dependencies(&indirect).unwrap_err().to_string(),
+            "catalog dependency cycle: a -> b -> c -> a"
         );
     }
 }

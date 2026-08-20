@@ -7,7 +7,9 @@ use serde::Serialize;
 
 use crate::catalog::{CatalogIndex, load_global_config, sync_registered_catalogs};
 use crate::installer::{InstallScope, install_with_catalogs};
-use crate::model::{InstalledState, ProjectConfig, SelectionMode, SkillSelection, validate_schema};
+use crate::model::{
+    EffectiveMode, InstalledState, ProjectConfig, SelectionMode, SkillSelection, validate_schema,
+};
 use crate::paths::{
     global_config_path, global_skills_root, global_state_path, read_json_or_default,
     write_global_config, write_json_atomic,
@@ -27,6 +29,7 @@ pub(crate) struct ConfigRow {
     pub(crate) selected: Option<SelectionMode>,
     pub(crate) gitignore: bool,
     pub(crate) installed: bool,
+    pub(crate) installed_mode: Option<EffectiveMode>,
     pub(crate) required_by: Vec<String>,
 }
 
@@ -143,11 +146,7 @@ fn config_rows(
                         .scopes
                         .get(&scope)
                         .map_or(i32::MAX, |metadata| metadata.order);
-                    let installed_name = if global_scope {
-                        skill.name.clone()
-                    } else {
-                        skill.installed_name.clone()
-                    };
+                    let installed_name = skill.installed_name.clone();
                     let selection = manifest.skills.get(&key);
                     let mut required_by: Vec<_> = catalog
                         .skills
@@ -156,18 +155,21 @@ fn config_rows(
                         .map(|candidate| candidate.name.clone())
                         .collect();
                     required_by.sort();
+                    let installed = state.skills.get(&key).filter(|installed| {
+                        installed.installed_name == installed_name
+                            && target_root
+                                .join(&installed.installed_name)
+                                .join("SKILL.md")
+                                .is_file()
+                    });
                     ConfigRow {
                         key: key.clone(),
                         catalog: catalog.alias.clone(),
                         scope,
                         scope_order,
                         name: skill.name.clone(),
-                        installed: state.skills.get(&key).is_some_and(|installed| {
-                            target_root
-                                .join(&installed.installed_name)
-                                .join("SKILL.md")
-                                .is_file()
-                        }),
+                        installed: installed.is_some(),
+                        installed_mode: installed.map(|skill| skill.mode),
                         installed_name,
                         description: skill.description.clone(),
                         global: skill.global,
@@ -320,6 +322,7 @@ mod tests {
             selected: None,
             gitignore: false,
             installed: false,
+            installed_mode: None,
             required_by: Vec::new(),
         }];
         let mut manifest = ProjectConfig::default();
@@ -383,7 +386,7 @@ mod tests {
         let global = config_rows(&catalogs, &state, Path::new("."), &manifest, true);
         let project = config_rows(&catalogs, &state, Path::new("."), &manifest, false);
         assert_eq!(global[0].name, "global");
-        assert_eq!(global[0].installed_name, "global");
+        assert_eq!(global[0].installed_name, "global-scope");
         assert_eq!(project[0].name, "project");
         assert_eq!(project[0].installed_name, "project-scope");
     }

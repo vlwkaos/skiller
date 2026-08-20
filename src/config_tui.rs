@@ -12,7 +12,7 @@ use crossterm::terminal::{
 use unicode_width::UnicodeWidthChar;
 
 use crate::config_ui::{ConfigRow, cycle_selection, toggle_gitignore};
-use crate::model::{ProjectConfig, SelectionMode, SkillSelection};
+use crate::model::{EffectiveMode, ProjectConfig, SelectionMode, SkillSelection};
 
 pub(crate) enum ConfigTuiResult {
     Save,
@@ -149,10 +149,11 @@ pub(crate) fn view_lines(
             Some(SelectionMode::Manual) => '◎',
             None => '○',
         };
-        let installed = if row.installed {
-            "installed"
-        } else {
-            "not installed"
+        let installed = match row.installed_mode {
+            Some(EffectiveMode::Enable) => "installed: Agent + Human",
+            Some(EffectiveMode::Manual) => "installed: Human",
+            Some(EffectiveMode::Dependency) => "installed: Agent dependency",
+            None => "not installed",
         };
         let ignored = if selection.is_some_and(SkillSelection::gitignore) {
             " · ignored"
@@ -179,7 +180,10 @@ pub(crate) fn view_lines(
             Some(SelectionMode::Manual) => "Human",
             None => "Off",
         };
-        lines.push(fit(&format!("  {mode} · {}", row.description), width));
+        lines.push(fit(
+            &format!("  {mode} selection · {}", row.description),
+            width,
+        ));
     }
     let ignore_hint = if global_scope { "" } else { "  i ignore" };
     lines.push(fit(
@@ -237,6 +241,7 @@ mod tests {
             selected: None,
             gitignore: false,
             installed,
+            installed_mode: installed.then_some(EffectiveMode::Enable),
             required_by: Vec::new(),
         }
     }

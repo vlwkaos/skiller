@@ -75,6 +75,14 @@ pub enum SelectionMode {
     Manual,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EffectiveMode {
+    Enable,
+    Manual,
+    Dependency,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogMetadata {
@@ -120,7 +128,7 @@ pub struct InstalledSkill {
     pub source_skill: String,
     pub installed_name: String,
     pub path: String,
-    pub mode: SelectionMode,
+    pub mode: EffectiveMode,
     #[serde(default)]
     pub gitignore: bool,
 }

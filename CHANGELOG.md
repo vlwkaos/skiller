@@ -1,3 +1,12 @@
+## [0.3.0] - 2026-08-20
+
+### Changed
+
+- Apply semantic scope postfixes to both global and project installed names.
+- Derive agent-only dependency availability independently from explicit Enabled and Manual selection.
+- Write Claude Code `user-invocable: false` for dependency-only skills and expose reconciled installed modes to configuration frontends.
+- Report complete direct and transitive dependency-cycle paths as hard catalog errors.
+
 ## [0.2.0] - 2026-08-20
 
 ### Features

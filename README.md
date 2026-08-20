@@ -50,10 +50,12 @@ Global catalog registration and selection share `~/.config/skiller/config.json`:
 
 The global file may be symlinked from dotfiles. Runtime ownership stays outside dotfiles under `${XDG_STATE_HOME:-~/.local/state}/skiller/installed.json`.
 
-- `enable`: normal Agent Skills discovery.
-- `manual`: adds supported explicit-invocation controls.
+- `enable`: agent and human invocation.
+- `manual`: human invocation without initial model discovery.
 - `gitignore`: omits that project skill's Vercel projections from Git.
 - Omitted entries are not selected. Required dependency closure is installed automatically.
+
+Dependency reachability is independent from configured mode. An unselected required skill is installed agent-only with Claude Code's `user-invocable: false`; a required manual skill becomes effectively Agent + Human, while an enabled skill is already fully available. Parent modes are never inherited. `config --print` reports the reconciled `installedMode` separately from `selected`. Dependency-only user hiding is portable only where the host supports it; Pygmalion hides those entries from human aliases, while other agents may still accept an exact invocation.
 
 ## Catalog format
 
@@ -78,9 +80,9 @@ skiller.json
 }
 ```
 
-Global configuration shows only `global: true` skills. Project configuration shows only project skills. Global names remain unchanged; project names receive their display-scope postfix, such as `develop-engineering`.
+Global configuration shows only `global: true` skills. Project configuration shows only project skills. Global and project installations receive their display-scope postfix, such as `develop-engineering`. The postfix keeps semantic scope portable across native agent command surfaces.
 
-Dependencies use a comma-separated string in `metadata.skiller.requires`. Missing targets and cycles fail catalog loading. Global dependency closure must also be global.
+Dependencies use a comma-separated string in `metadata.skiller.requires`. Missing targets and direct or transitive cycles fail catalog loading with the complete cycle path. Global dependency closure must also be global.
 
 ## Installation and ownership
 

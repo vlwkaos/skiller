@@ -5,8 +5,10 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use crate::catalog::{CatalogIndex, load_global_config, sync_registered_catalogs};
-use crate::manual::{apply_manual_mode, rename_skill};
-use crate::model::{InstalledSkill, InstalledState, ProjectConfig, SelectionMode, validate_schema};
+use crate::manual::{apply_invocation_mode, rename_skill};
+use crate::model::{
+    EffectiveMode, InstalledSkill, InstalledState, ProjectConfig, SelectionMode, validate_schema,
+};
 use crate::paths::{
     cache_root, copy_tree, ensure_real_dir, global_skills_root, global_state_path, read_json,
     read_json_or_default, safe_remove_owned_dir, sanitize_child_output, write_json_atomic,
@@ -35,7 +37,7 @@ struct ResolvedSkill<'a> {
     catalog: &'a CatalogIndex,
     source_name: String,
     installed_name: String,
-    mode: SelectionMode,
+    mode: EffectiveMode,
     gitignore: bool,
 }
 
@@ -157,7 +159,11 @@ pub fn install_with_catalogs(
 
     let manual_count = resolved
         .iter()
-        .filter(|skill| skill.mode == SelectionMode::Manual)
+        .filter(|skill| skill.mode == EffectiveMode::Manual)
+        .count();
+    let dependency_count = resolved
+        .iter()
+        .filter(|skill| skill.mode == EffectiveMode::Dependency)
         .count();
     println!(
         "installed {} managed {} skill{} through Vercel Skills",
@@ -172,6 +178,11 @@ pub fn install_with_catalogs(
     if manual_count > 0 {
         println!(
             "warning: manual mode is enforced by Pi, Claude Code, Cursor, and Codex; OpenCode and Gemini CLI may still expose these skills to the model"
+        );
+    }
+    if dependency_count > 0 {
+        println!(
+            "warning: dependency-only user hiding is enforced by Claude Code and Pygmalion; other agents may expose exact invocation"
         );
     }
     Ok(())
@@ -208,19 +219,23 @@ fn resolve_manifest<'a>(
     catalogs: &'a BTreeMap<String, CatalogIndex>,
     global_scope: bool,
 ) -> Result<Vec<ResolvedSkill<'a>>> {
-    let mut selected = BTreeMap::<String, (SelectionMode, bool, bool)>::new();
+    let mut selected = BTreeMap::<String, (Option<SelectionMode>, bool, bool)>::new();
     for (key, selection) in &manifest.skills {
-        selected.insert(key.clone(), (selection.mode(), selection.gitignore(), true));
+        selected.insert(
+            key.clone(),
+            (Some(selection.mode()), selection.gitignore(), false),
+        );
     }
 
     let roots: Vec<_> = selected.keys().cloned().collect();
+    let mut visited = BTreeSet::new();
     for key in roots {
-        add_dependency_closure(&key, catalogs, global_scope, &mut selected)?;
+        add_dependency_closure(&key, catalogs, global_scope, &mut selected, &mut visited)?;
     }
 
     let mut installed_names = BTreeMap::<String, String>::new();
     let mut resolved = Vec::new();
-    for (key, (mode, gitignore, explicit)) in selected {
+    for (key, (selected_mode, gitignore, required)) in selected {
         let (alias, source_name) = split_key(&key)?;
         let source_name = source_name.to_owned();
         let catalog = catalogs
@@ -230,7 +245,7 @@ fn resolve_manifest<'a>(
             .skills
             .get(&source_name)
             .with_context(|| format!("catalog {alias} has no skill named {source_name}"))?;
-        if explicit && skill.global != global_scope {
+        if selected_mode.is_some() && skill.global != global_scope {
             bail!(
                 "{} skill {key} cannot be selected in {} configuration",
                 if skill.global { "global" } else { "project" },
@@ -240,10 +255,14 @@ fn resolve_manifest<'a>(
         if global_scope && gitignore {
             bail!("global skill {key} cannot use project Git ignore state");
         }
-        let installed_name = if global_scope {
-            skill.name.clone()
-        } else {
-            skill.installed_name.clone()
+        let installed_name = skill.installed_name.clone();
+        let mode = match (selected_mode, required) {
+            (Some(SelectionMode::Enable), _) | (Some(SelectionMode::Manual), true) => {
+                EffectiveMode::Enable
+            }
+            (Some(SelectionMode::Manual), false) => EffectiveMode::Manual,
+            (None, true) => EffectiveMode::Dependency,
+            (None, false) => unreachable!("resolved skill is neither selected nor required"),
         };
         if let Some(other) = installed_names.insert(installed_name.clone(), key.clone()) {
             bail!("installed skill name collision: {other} and {key} both become {installed_name}");
@@ -264,8 +283,12 @@ fn add_dependency_closure(
     key: &str,
     catalogs: &BTreeMap<String, CatalogIndex>,
     global_scope: bool,
-    selected: &mut BTreeMap<String, (SelectionMode, bool, bool)>,
+    selected: &mut BTreeMap<String, (Option<SelectionMode>, bool, bool)>,
+    visited: &mut BTreeSet<String>,
 ) -> Result<()> {
+    if !visited.insert(key.to_owned()) {
+        return Ok(());
+    }
     let (alias, source_name) = split_key(key)?;
     let catalog = catalogs
         .get(alias)
@@ -285,13 +308,11 @@ fn add_dependency_closure(
             continue;
         }
         let dependency_key = format!("{alias}/{dependency}");
-        if !selected.contains_key(&dependency_key) {
-            selected.insert(
-                dependency_key.clone(),
-                (SelectionMode::Manual, false, false),
-            );
-            add_dependency_closure(&dependency_key, catalogs, global_scope, selected)?;
-        }
+        selected
+            .entry(dependency_key.clone())
+            .and_modify(|entry| entry.2 = true)
+            .or_insert((None, false, true));
+        add_dependency_closure(&dependency_key, catalogs, global_scope, selected, visited)?;
     }
     Ok(())
 }
@@ -331,9 +352,7 @@ fn prepare_skills(
             let destination = prepared_root.join("skills").join(&skill.installed_name);
             copy_tree(&source, &destination)?;
             rename_skill(&destination, &skill.installed_name)?;
-            if skill.mode == SelectionMode::Manual {
-                apply_manual_mode(&destination)?;
-            }
+            apply_invocation_mode(&destination, skill.mode)?;
         }
     }
     Ok(())
@@ -579,7 +598,9 @@ fn update_gitignore(project_root: &Path, state: &InstalledState) -> Result<()> {
 mod tests {
     use super::*;
     use crate::catalog::CatalogSkill;
-    use crate::model::{CatalogMetadata, GlobalConfig, SCHEMA_VERSION, SkillSelection};
+    use crate::model::{
+        CatalogMetadata, EffectiveMode, GlobalConfig, SCHEMA_VERSION, SkillSelection,
+    };
 
     fn catalog(global: bool) -> CatalogIndex {
         CatalogIndex {
@@ -626,9 +647,32 @@ mod tests {
         let catalogs = BTreeMap::from([("pyg".to_owned(), catalog(true))]);
         let resolved = resolve_manifest(&manifest, &catalogs, true).unwrap();
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].installed_name, "dependency");
-        assert_eq!(resolved[0].mode, SelectionMode::Manual);
+        assert_eq!(resolved[0].installed_name, "dependency-engineering");
+        assert_eq!(resolved[0].mode, EffectiveMode::Dependency);
+        assert_eq!(resolved[1].installed_name, "root-engineering");
+        assert_eq!(resolved[1].mode, EffectiveMode::Enable);
         assert!(resolve_manifest(&manifest, &catalogs, false).is_err());
+    }
+
+    #[test]
+    fn configured_mode_and_dependency_reachability_form_effective_capabilities() {
+        let catalogs = BTreeMap::from([("pyg".to_owned(), catalog(true))]);
+        let manifest = ProjectConfig {
+            version: SCHEMA_VERSION,
+            skills: BTreeMap::from([
+                (
+                    "pyg/root".to_owned(),
+                    SkillSelection::Mode(SelectionMode::Manual),
+                ),
+                (
+                    "pyg/dependency".to_owned(),
+                    SkillSelection::Mode(SelectionMode::Manual),
+                ),
+            ]),
+        };
+        let resolved = resolve_manifest(&manifest, &catalogs, true).unwrap();
+        assert_eq!(resolved[0].mode, EffectiveMode::Enable);
+        assert_eq!(resolved[1].mode, EffectiveMode::Manual);
     }
 
     #[test]
