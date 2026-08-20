@@ -1,3 +1,9 @@
+## [0.1.1] - 2026-08-20
+
+### Fixed
+
+- Install through explicit Vercel Skills targets for the universal canonical store, Claude Code, and Pi.
+
 ## [0.1.0] - 2026-08-20
 
 ### Features

@@ -13,6 +13,7 @@ use crate::paths::{
 };
 
 const VERCEL_SKILLS_PACKAGE: &str = "skills@1.5.23";
+const VERCEL_INSTALL_AGENTS: &[&str] = &["universal", "claude-code", "pi"];
 const IGNORE_START: &str = "# skiller:start";
 const IGNORE_END: &str = "# skiller:end";
 
@@ -368,13 +369,20 @@ fn run_vercel_install(
     for skill in resolved {
         command.args(["--skill", &skill.installed_name]);
     }
-    // ^ skills@1.5.23 creates canonical Agent Skills and agent-specific links unless --copy is used.
-    command.args(["--agent", "*", "--yes"]);
+    // ^ skills@1.5.23 writes the universal canonical skill and explicit Claude Code/Pi projections.
+    append_vercel_install_targets(&mut command);
     if global_scope {
         command.arg("--global");
     }
     command.current_dir(command_root);
     run_command(command, "installing prepared skills")
+}
+
+fn append_vercel_install_targets(command: &mut Command) {
+    command
+        .arg("--agent")
+        .args(VERCEL_INSTALL_AGENTS)
+        .arg("--yes");
 }
 
 fn run_vercel_remove(command_root: &Path, names: &[String], global_scope: bool) -> Result<()> {
@@ -626,5 +634,16 @@ mod tests {
     #[test]
     fn absent_global_selection_is_supported() {
         assert!(GlobalConfig::default().skills.is_empty());
+    }
+
+    #[test]
+    fn vercel_install_targets_universal_claude_and_pi_explicitly() {
+        let mut command = Command::new("skills");
+        append_vercel_install_targets(&mut command);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["--agent", "universal", "claude-code", "pi", "--yes"]);
     }
 }

@@ -82,7 +82,7 @@ Dependencies use a comma-separated string in `metadata.skiller.requires`. Missin
 
 ## Installation and ownership
 
-Skiller stages untrusted catalog content through `skills@1.5.23`, rejects symlinks and invalid names, applies naming/manual transforms, then invokes Vercel Skills again as the final writer. Vercel creates canonical Agent Skills and agent-specific links.
+Skiller stages untrusted catalog content through `skills@1.5.23`, rejects symlinks and invalid names, applies naming/manual transforms, then invokes Vercel Skills again as the final writer with explicit `universal`, `claude-code`, and `pi` targets. Vercel creates the canonical Agent Skills store and Claude Code/Pi projections.
 
 Project ownership lives in `.skiller/installed.json`; global ownership lives in the XDG state path. Removal passes only previously owned names to Vercel Skills. Skiller never removes unrelated skills.
 
