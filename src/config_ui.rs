@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -38,7 +38,7 @@ struct PrintedConfig<'a> {
     skills: &'a [ConfigRow],
 }
 
-pub fn configure(scope: InstallScope, print_only: bool) -> Result<()> {
+pub fn configure(scope: InstallScope, print_only: bool, assignments: &[String]) -> Result<()> {
     let mut global_config = load_global_config()?;
     if global_config.catalogs.is_empty() {
         anyhow::bail!("no catalogs configured; run `skiller add-catalog <alias> <source>`");
@@ -87,6 +87,12 @@ pub fn configure(scope: InstallScope, print_only: bool) -> Result<()> {
             skills: &rows,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+    if !assignments.is_empty() {
+        apply_assignments(&mut manifest, &rows, assignments)?;
+        save_manifest(&scope, &config_path, &manifest, &mut global_config)?;
+        println!("saved {}", config_path.display());
         return Ok(());
     }
 
@@ -282,6 +288,45 @@ fn render(rows: &[ConfigRow], manifest: &ProjectConfig, global_scope: bool) {
     println!();
 }
 
+fn apply_assignments(
+    manifest: &mut ProjectConfig,
+    rows: &[ConfigRow],
+    assignments: &[String],
+) -> Result<()> {
+    let available: BTreeSet<_> = rows.iter().map(|row| row.key.as_str()).collect();
+    let mut seen = BTreeSet::new();
+    for assignment in assignments {
+        let (key, mode) = assignment.split_once('=').with_context(|| {
+            format!("invalid selection {assignment:?}; expected catalog/name=enable|manual|off")
+        })?;
+        if !available.contains(key) {
+            anyhow::bail!("skill is unavailable in this configuration: {key}");
+        }
+        if !seen.insert(key) {
+            anyhow::bail!("duplicate skill selection: {key}");
+        }
+        match mode {
+            "enable" => {
+                manifest.skills.insert(
+                    key.to_owned(),
+                    SkillSelection::from_parts(SelectionMode::Enable, false),
+                );
+            }
+            "manual" => {
+                manifest.skills.insert(
+                    key.to_owned(),
+                    SkillSelection::from_parts(SelectionMode::Manual, false),
+                );
+            }
+            "off" => {
+                manifest.skills.remove(key);
+            }
+            _ => anyhow::bail!("invalid mode for {key}: {mode}; expected enable, manual, or off"),
+        }
+    }
+    Ok(())
+}
+
 fn cycle_selection(manifest: &mut ProjectConfig, key: &str) {
     let next = match manifest.skills.get(key).map(SkillSelection::mode) {
         None => Some(SelectionMode::Enable),
@@ -366,6 +411,45 @@ mod tests {
         assert_eq!(manifest.skills["pyg/develop"].mode(), SelectionMode::Manual);
         cycle_selection(&mut manifest, "pyg/develop");
         assert!(!manifest.skills.contains_key("pyg/develop"));
+    }
+
+    #[test]
+    fn assignments_apply_modes_and_reject_unknown_or_duplicate_skills() {
+        let rows = vec![ConfigRow {
+            key: "pyg/develop".to_owned(),
+            catalog: "pyg".to_owned(),
+            scope: "engineering".to_owned(),
+            scope_order: 0,
+            name: "develop".to_owned(),
+            installed_name: "develop".to_owned(),
+            description: "Develop".to_owned(),
+            global: true,
+            selected: None,
+            gitignore: false,
+            installed: false,
+            required_by: Vec::new(),
+        }];
+        let mut manifest = ProjectConfig::default();
+        apply_assignments(&mut manifest, &rows, &["pyg/develop=enable".to_owned()]).unwrap();
+        assert_eq!(manifest.skills["pyg/develop"].mode(), SelectionMode::Enable);
+        apply_assignments(&mut manifest, &rows, &["pyg/develop=manual".to_owned()]).unwrap();
+        assert_eq!(manifest.skills["pyg/develop"].mode(), SelectionMode::Manual);
+        apply_assignments(&mut manifest, &rows, &["pyg/develop=off".to_owned()]).unwrap();
+        assert!(!manifest.skills.contains_key("pyg/develop"));
+        assert!(
+            apply_assignments(&mut manifest, &rows, &["pyg/missing=enable".to_owned()]).is_err()
+        );
+        assert!(
+            apply_assignments(
+                &mut manifest,
+                &rows,
+                &[
+                    "pyg/develop=enable".to_owned(),
+                    "pyg/develop=manual".to_owned()
+                ]
+            )
+            .is_err()
+        );
     }
 
     #[test]

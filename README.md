@@ -6,13 +6,13 @@
 
 ```bash
 skiller add-catalog pyg vlwkaos/skills
-skiller config [--print]
+skiller config [--print] [--set catalog/name=enable|manual|off]
 skiller install [--migrate]
-skiller config -g [--print]
+skiller config -g [--print] [--set catalog/name=enable|manual|off]
 skiller install -g [--migrate]
 ```
 
-`--print` emits machine-readable catalog, selection, dependency, and installed state without prompting or changing configuration/installation state; remote catalog refresh may update Skiller's cache. `--migrate` adopts same-name legacy installations only after every selected source stages successfully. Unrelated skills remain untouched.
+`--print` emits machine-readable catalog, selection, dependency, and installed state without prompting or changing configuration/installation state; remote catalog refresh may update Skiller's cache. `--set` applies one or more validated selections without installing, so a frontend can save once and then run `skiller install`. `--migrate` adopts same-name legacy installations only after every selected source stages successfully. Unrelated skills remain untouched.
 
 ## Configuration
 

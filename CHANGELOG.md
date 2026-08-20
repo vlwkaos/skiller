@@ -1,3 +1,9 @@
+## [0.1.2] - 2026-08-20
+
+### Features
+
+- Add bounded noninteractive `config --set catalog/name=enable|manual|off` updates for trusted configuration frontends.
+
 ## [0.1.1] - 2026-08-20
 
 ### Fixed

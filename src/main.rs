@@ -34,8 +34,11 @@ enum Command {
         #[arg(short = 'g', long)]
         global: bool,
         /// Print machine-readable catalog, selection, and installed state
-        #[arg(long)]
+        #[arg(long, conflicts_with = "set")]
         print: bool,
+        /// Set one or more selections as catalog/name=enable|manual|off
+        #[arg(long, value_name = "SKILL=MODE")]
+        set: Vec<String>,
     },
     /// Reconcile catalog-managed skills through Vercel Skills
     Install {
@@ -52,13 +55,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::AddCatalog { alias, source } => catalog::add_catalog(&alias, &source),
-        Command::Config { global, print } => {
+        Command::Config { global, print, set } => {
             let scope = if global {
                 installer::InstallScope::Global
             } else {
                 installer::InstallScope::Project(paths::project_root()?)
             };
-            config_ui::configure(scope, print)
+            config_ui::configure(scope, print, &set)
         }
         Command::Install { global, migrate } => {
             let scope = if global {
