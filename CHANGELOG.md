@@ -1,3 +1,9 @@
+## [0.7.2] - 2026-08-21
+
+### Fixed
+
+- Use a stable transaction-owned prepared source so project `skills-lock.json` does not churn on every install.
+
 ## [0.7.1] - 2026-08-21
 
 ### Fixed

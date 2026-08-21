@@ -157,6 +157,7 @@ pub(crate) fn install_with_catalogs_recovery(
     let prepared_root = paths
         .work_root
         .join(format!("prepared-{}", std::process::id()));
+    let stable_prepared_root = paths.work_root.join("prepared-current");
     let setup = (|| -> Result<()> {
         safe_remove_owned_dir(&staging_root, &paths.work_root)?;
         safe_remove_owned_dir(&prepared_root, &paths.work_root)?;
@@ -211,9 +212,16 @@ pub(crate) fn install_with_catalogs_recovery(
         } else {
             write_json_exclusive_compact(&paths.transaction_path, &journal)?;
         }
+        safe_remove_owned_dir(&stable_prepared_root, &paths.work_root)?;
+        std::fs::rename(&prepared_root, &stable_prepared_root).with_context(|| {
+            format!(
+                "promoting prepared installation source to {}",
+                stable_prepared_root.display()
+            )
+        })?;
         run_vercel_install(
             &paths.command_root,
-            &prepared_root,
+            &stable_prepared_root,
             &resolved,
             &manifest.agents,
             scope.is_global(),
@@ -222,7 +230,7 @@ pub(crate) fn install_with_catalogs_recovery(
         write_json_atomic_compact(&paths.transaction_path, &journal)?;
         retry_missing_installations(
             &paths.command_root,
-            &prepared_root,
+            &stable_prepared_root,
             scope.is_global(),
             &resolved,
             &manifest.agents,
@@ -271,9 +279,11 @@ pub(crate) fn install_with_catalogs_recovery(
 
     let staging_cleanup = safe_remove_owned_dir(&staging_root, &paths.work_root);
     let prepared_cleanup = safe_remove_owned_dir(&prepared_root, &paths.work_root);
+    let stable_prepared_cleanup = safe_remove_owned_dir(&stable_prepared_root, &paths.work_root);
     result?;
     staging_cleanup?;
     prepared_cleanup?;
+    stable_prepared_cleanup?;
 
     let manual_count = resolved
         .iter()
