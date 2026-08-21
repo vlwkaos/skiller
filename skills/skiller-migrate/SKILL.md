@@ -28,7 +28,7 @@ Use Skiller's migration-plan engine. The app owns validation, copying, configura
 7. Run `--check`. Resolve every invalid name, dependency, scope, eligibility, collision, symlink, or unowned path before applying.
 8. Show the complete plan and ask approval. Use `--yes` only when the user already approved that exact checked plan.
 9. Apply. Skiller copies catalog sources, creates configuration, installs through pinned Vercel Skills, verifies every selected agent through Vercel's JSON listing, and records ownership.
-10. Run Doctor again. Inspect the catalog diff before any commit or publication.
+10. Run Doctor again. After any physical-name migration, reload the current agent session before invoking skill-relative scripts; cached skill paths may still reference old names. Inspect the catalog diff before any commit or publication.
 11. If cleanup was deferred, create and check a second exact plan with `cleanupLegacy: true`; apply only after replacement installation is healthy.
 12. Report catalog/config/state paths, selected agents, modes, cleanup names, verification, and remaining commit/push/reload steps.
 
