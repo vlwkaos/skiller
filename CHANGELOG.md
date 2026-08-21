@@ -1,3 +1,17 @@
+## [0.5.0] - 2026-08-21
+
+### Features
+
+- Add read-only project and global Doctor diagnostics with compact JSON output and explicit confirmation-gated repair.
+- Add validated catalog rename declarations and deterministic configuration-key migration.
+- Add compact installed-state schema 2 with transparent reads of schema 1.
+- Add owned transaction journals for interrupted install recovery.
+
+### Security
+
+- Block repair on invalid configuration, invalid journals, or unowned projection conflicts.
+- Limit recovery cleanup and replacement to prior ownership or names recorded after conflict validation.
+
 ## [0.4.0] - 2026-08-21
 
 ### Features

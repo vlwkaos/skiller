@@ -9,8 +9,10 @@ skiller add-catalog pyg vlwkaos/skills
 skiller catalog add-skill --root <catalog> --source <skill> --scope <scope> --global|--project
 skiller config [--print] [--set catalog/name=enable|manual|off] [--set-gitignore catalog/name=true|false]
 skiller install [--migrate]
+skiller doctor [--print|--repair [--yes]]
 skiller config -g [--print] [--set catalog/name=enable|manual|off]
 skiller install -g [--migrate]
+skiller doctor -g [--print|--repair [--yes]]
 ```
 
 Interactive `config` opens a scoped terminal UI: arrows navigate, Space cycles Agent + Human, Human, and Off, `i` toggles project Git-ignore state, and `s` or Enter saves. Escape or `q` cancels without writing.
@@ -77,6 +79,9 @@ skiller.json
   "skills": {
     "develop": { "scope": "engineering", "global": true },
     "commit": { "scope": "engineering", "global": false }
+  },
+  "renames": {
+    "old-develop": "develop"
   }
 }
 ```
@@ -89,18 +94,63 @@ Global configuration shows only `global: true` skills. Project configuration sho
 
 Dependencies use a comma-separated string in `metadata.skiller.requires`. Missing targets and direct or transitive cycles fail catalog loading with the complete cycle path. Global dependency closure must also be global.
 
+Source-name changes must be declared in `renames`. Every rename chain must be acyclic and end at a current skill. Skiller never infers identity from descriptions or files. Doctor can then migrate configuration keys while preserving modes and project Git-ignore state.
+
 ## Installation and ownership
 
 Skiller stages untrusted catalog content through `skills@1.5.23`, rejects symlinks and invalid names, applies naming/manual transforms, then invokes Vercel Skills again as the final writer with explicit `universal`, `claude-code`, and `pi` targets. Vercel creates the canonical Agent Skills store and Claude Code/Pi projections.
 
-Project ownership lives in `.skiller/installed.json`; global ownership lives in the XDG state path. Removal passes only previously owned names to Vercel Skills. Skiller never removes unrelated skills.
+Project ownership lives in `.skiller/installed.json`; global ownership lives in the XDG state path. Version 2 stores only each stable catalog key's installed name, effective mode (`e`, `m`, or `d`), and Git-ignore bit. Skiller reads verbose version 1 state and writes compact version 2 state after successful reconciliation. Removal passes only previously owned names to Vercel Skills. Skiller never removes unrelated skills.
 
-## New machine
+Each install writes a compact transaction journal before final placement, advances it through prepared, installed, verified, and cleaned phases, and removes it only after ownership and Git-ignore state commit. A later normal install refuses an unfinished journal.
 
-1. Install Skiller through Homebrew or Cargo.
-2. Apply dotfiles so `~/.config/skiller/config.json` points to the tracked global configuration.
-3. Run `skiller install -g` on a clean machine.
-4. Run `skiller install -g --migrate` when replacing legacy global skill roots.
-5. In each project, run `skiller install` or `skiller install --migrate` once for legacy project layouts.
+## Doctor and recovery
 
-`--migrate` unlinks legacy vendor root symlinks without deleting their source tree, then lets Vercel recreate per-skill links.
+`doctor` is read-only by default, although refreshing a remote catalog may update Skiller's cache. It diagnoses declared renames, malformed or stale configuration, dependency and eligibility errors, obsolete ownership, missing universal/Claude Code/Pi projections, owned staging residue, unowned conflicts, and interrupted transactions. `--print` emits compact JSON.
+
+`doctor --repair` previews repairable findings and prompts before changing state. Use `--yes` only for an already-reviewed noninteractive repair. Repair applies declared renames, preserves modes and Git-ignore state, removes only proven owned residue, and runs normal verified reconciliation. Any unowned conflict or invalid configuration blocks all repair.
+
+## Apply on another machine
+
+### Existing machine upgrading from Skiller 0.4
+
+```bash
+brew update
+brew upgrade vlwkaos/tap/skiller
+skiller --version
+skiller doctor -g --print
+skiller doctor -g --repair
+skiller doctor -g
+```
+
+The expected version is `skiller 0.5.0`. Review the JSON report before repair. The repair rewrites legacy ownership state compactly and restores missing projections. For each configured project:
+
+```bash
+cd <project>
+skiller doctor --print
+skiller doctor --repair
+skiller doctor
+```
+
+### Clean machine
+
+1. Apply dotfiles first so `~/.config/skiller/config.json` resolves to the tracked global configuration.
+2. Install Skiller:
+   ```bash
+   brew install vlwkaos/tap/skiller
+   skiller --version
+   ```
+3. Install the declared global selection:
+   ```bash
+   skiller install -g
+   skiller doctor -g
+   ```
+4. In each project containing `skiller.config.json`:
+   ```bash
+   cd <project>
+   skiller install
+   skiller doctor
+   ```
+5. Use `install --migrate` instead of normal install only when replacing same-name legacy copies or legacy vendor-root links.
+
+For unattended provisioning, first inspect `doctor -g --print`, then use `doctor -g --repair --yes`. Do not use `--yes` without retaining the diagnostic output. `--migrate` unlinks legacy vendor root symlinks without deleting their source tree.

@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const SCHEMA_VERSION: u32 = 1;
+pub const INSTALLED_STATE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +93,8 @@ pub struct CatalogMetadata {
     pub scopes: BTreeMap<String, ScopeMetadata>,
     #[serde(default)]
     pub skills: BTreeMap<String, CatalogSkillMetadata>,
+    #[serde(default)]
+    pub renames: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,25 +115,171 @@ pub struct CatalogSkillMetadata {
     pub global: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledState {
-    #[serde(default = "schema_version")]
     pub version: u32,
-    #[serde(default)]
     pub skills: BTreeMap<String, InstalledSkill>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledSkill {
-    pub catalog: String,
-    pub source_skill: String,
     pub installed_name: String,
-    pub path: String,
     pub mode: EffectiveMode,
-    #[serde(default)]
     pub gitignore: bool,
+    pub legacy_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CompactInstalledState<'a> {
+    v: u32,
+    skills: BTreeMap<&'a str, (&'a str, CompactMode, bool)>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CompactMode {
+    E,
+    M,
+    D,
+}
+
+impl From<EffectiveMode> for CompactMode {
+    fn from(value: EffectiveMode) -> Self {
+        match value {
+            EffectiveMode::Enable => Self::E,
+            EffectiveMode::Manual => Self::M,
+            EffectiveMode::Dependency => Self::D,
+        }
+    }
+}
+
+impl From<CompactMode> for EffectiveMode {
+    fn from(value: CompactMode) -> Self {
+        match value {
+            CompactMode::E => Self::Enable,
+            CompactMode::M => Self::Manual,
+            CompactMode::D => Self::Dependency,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InstalledStateWire {
+    Compact {
+        v: u32,
+        #[serde(default)]
+        skills: BTreeMap<String, (String, CompactMode, bool)>,
+    },
+    Legacy {
+        #[serde(default = "schema_version")]
+        version: u32,
+        #[serde(default)]
+        skills: BTreeMap<String, LegacyInstalledSkill>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyInstalledSkill {
+    catalog: String,
+    source_skill: String,
+    installed_name: String,
+    path: String,
+    mode: EffectiveMode,
+    #[serde(default)]
+    gitignore: bool,
+}
+
+impl Serialize for InstalledState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let skills = self
+            .skills
+            .iter()
+            .map(|(key, skill)| {
+                (
+                    key.as_str(),
+                    (
+                        skill.installed_name.as_str(),
+                        CompactMode::from(skill.mode),
+                        skill.gitignore,
+                    ),
+                )
+            })
+            .collect();
+        CompactInstalledState {
+            v: INSTALLED_STATE_VERSION,
+            skills,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for InstalledState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = InstalledStateWire::deserialize(deserializer)?;
+        match wire {
+            InstalledStateWire::Compact { v, skills } => {
+                if v != INSTALLED_STATE_VERSION {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported installed state schema version {v}; expected {INSTALLED_STATE_VERSION}"
+                    )));
+                }
+                Ok(Self {
+                    version: v,
+                    skills: skills
+                        .into_iter()
+                        .map(|(key, (installed_name, mode, gitignore))| {
+                            (
+                                key,
+                                InstalledSkill {
+                                    installed_name,
+                                    mode: mode.into(),
+                                    gitignore,
+                                    legacy_path: None,
+                                },
+                            )
+                        })
+                        .collect(),
+                })
+            }
+            InstalledStateWire::Legacy { version, skills } => {
+                if version != SCHEMA_VERSION {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported installed state schema version {version}; expected {SCHEMA_VERSION} or {INSTALLED_STATE_VERSION}"
+                    )));
+                }
+                let mut converted = BTreeMap::new();
+                for (key, skill) in skills {
+                    let expected_key = format!("{}/{}", skill.catalog, skill.source_skill);
+                    if key != expected_key {
+                        return Err(serde::de::Error::custom(format!(
+                            "installed state key {key} does not match {expected_key}"
+                        )));
+                    }
+                    converted.insert(
+                        key,
+                        InstalledSkill {
+                            installed_name: skill.installed_name,
+                            mode: skill.mode,
+                            gitignore: skill.gitignore,
+                            legacy_path: Some(skill.path),
+                        },
+                    );
+                }
+                Ok(Self {
+                    version,
+                    skills: converted,
+                })
+            }
+        }
+    }
 }
 
 impl Default for GlobalConfig {
@@ -158,6 +307,7 @@ impl Default for CatalogMetadata {
             version: SCHEMA_VERSION,
             scopes: BTreeMap::new(),
             skills: BTreeMap::new(),
+            renames: BTreeMap::new(),
         }
     }
 }
@@ -165,7 +315,7 @@ impl Default for CatalogMetadata {
 impl Default for InstalledState {
     fn default() -> Self {
         Self {
-            version: SCHEMA_VERSION,
+            version: INSTALLED_STATE_VERSION,
             skills: BTreeMap::new(),
         }
     }
@@ -174,6 +324,15 @@ impl Default for InstalledState {
 pub fn validate_schema(version: u32, kind: &str) -> Result<()> {
     if version != SCHEMA_VERSION {
         bail!("unsupported {kind} schema version {version}; expected {SCHEMA_VERSION}");
+    }
+    Ok(())
+}
+
+pub fn validate_installed_state(version: u32) -> Result<()> {
+    if version != SCHEMA_VERSION && version != INSTALLED_STATE_VERSION {
+        bail!(
+            "unsupported installed state schema version {version}; expected {SCHEMA_VERSION} or {INSTALLED_STATE_VERSION}"
+        );
     }
     Ok(())
 }
@@ -209,7 +368,7 @@ mod tests {
         assert_eq!(GlobalConfig::default().version, SCHEMA_VERSION);
         assert_eq!(ProjectConfig::default().version, SCHEMA_VERSION);
         assert_eq!(CatalogMetadata::default().version, SCHEMA_VERSION);
-        assert_eq!(InstalledState::default().version, SCHEMA_VERSION);
+        assert_eq!(InstalledState::default().version, INSTALLED_STATE_VERSION);
     }
 
     #[test]
@@ -222,6 +381,26 @@ mod tests {
         assert!(!config.skills["pyg/a"].gitignore());
         assert_eq!(config.skills["pyg/b"].mode(), SelectionMode::Manual);
         assert!(config.skills["pyg/b"].gitignore());
+    }
+
+    #[test]
+    fn installed_state_reads_legacy_and_writes_compact_schema() {
+        let legacy = r#"{"version":1,"skills":{"pyg/learn":{"catalog":"pyg","source_skill":"learn","installed_name":"learn-learning","path":".agents/skills/learn-learning","mode":"enable","gitignore":false}}}"#;
+        let state: InstalledState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(state.version, SCHEMA_VERSION);
+        assert_eq!(
+            state.skills["pyg/learn"].legacy_path.as_deref(),
+            Some(".agents/skills/learn-learning")
+        );
+
+        let compact = serde_json::to_string(&state).unwrap();
+        assert_eq!(
+            compact,
+            r#"{"v":2,"skills":{"pyg/learn":["learn-learning","e",false]}}"#
+        );
+        let round_trip: InstalledState = serde_json::from_str(&compact).unwrap();
+        assert_eq!(round_trip.version, INSTALLED_STATE_VERSION);
+        assert_eq!(round_trip.skills["pyg/learn"].mode, EffectiveMode::Enable);
     }
 
     #[test]

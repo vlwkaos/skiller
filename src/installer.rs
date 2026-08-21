@@ -3,15 +3,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 use crate::catalog::{CatalogIndex, load_global_config, sync_registered_catalogs};
 use crate::manual::{apply_invocation_mode, rename_skill};
 use crate::model::{
-    EffectiveMode, InstalledSkill, InstalledState, ProjectConfig, SelectionMode, validate_schema,
+    EffectiveMode, INSTALLED_STATE_VERSION, InstalledSkill, InstalledState, ProjectConfig,
+    SelectionMode, validate_installed_state, validate_schema,
 };
 use crate::paths::{
     cache_root, copy_tree, ensure_real_dir, global_skills_root, global_state_path, read_json,
-    read_json_or_default, safe_remove_owned_dir, sanitize_child_output, write_json_atomic,
+    read_json_or_default, safe_remove_owned_dir, sanitize_child_output, validate_managed_json_path,
+    write_json_atomic_compact,
 };
 
 const VERCEL_SKILLS_PACKAGE: &str = "skills@1.5.23";
@@ -32,21 +35,40 @@ impl InstallScope {
 }
 
 #[derive(Debug)]
-struct ResolvedSkill<'a> {
-    key: String,
+pub(crate) struct ResolvedSkill<'a> {
+    pub(crate) key: String,
     catalog: &'a CatalogIndex,
     source_name: String,
-    installed_name: String,
-    mode: EffectiveMode,
-    gitignore: bool,
+    pub(crate) installed_name: String,
+    pub(crate) mode: EffectiveMode,
+    pub(crate) gitignore: bool,
 }
 
-struct InstallPaths {
-    state_path: PathBuf,
-    work_root: PathBuf,
-    target_root: PathBuf,
-    command_root: PathBuf,
-    state_prefix: &'static str,
+pub(crate) struct InstallPaths {
+    pub(crate) state_path: PathBuf,
+    pub(crate) transaction_path: PathBuf,
+    pub(crate) work_root: PathBuf,
+    pub(crate) command_root: PathBuf,
+    pub(crate) state_prefix: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum TransactionPhase {
+    P,
+    I,
+    V,
+    C,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TransactionJournal {
+    pub(crate) v: u32,
+    pub(crate) scope: String,
+    pub(crate) phase: TransactionPhase,
+    pub(crate) config: String,
+    pub(crate) desired: Vec<String>,
+    pub(crate) remove: Vec<String>,
 }
 
 pub fn install(scope: InstallScope, migrate: bool) -> Result<()> {
@@ -71,13 +93,39 @@ pub fn install_with_catalogs(
     catalogs: &BTreeMap<String, CatalogIndex>,
     migrate: bool,
 ) -> Result<()> {
+    install_with_catalogs_recovery(scope, manifest, catalogs, migrate, &BTreeSet::new(), false)
+}
+
+pub(crate) fn install_with_catalogs_recovery(
+    scope: InstallScope,
+    manifest: &ProjectConfig,
+    catalogs: &BTreeMap<String, CatalogIndex>,
+    migrate: bool,
+    recovery_owned: &BTreeSet<String>,
+    recovering: bool,
+) -> Result<()> {
     validate_schema(manifest.version, "skill config")?;
     let paths = install_paths(&scope)?;
+    validate_managed_json_path(&paths.state_path)?;
+    validate_managed_json_path(&paths.transaction_path)?;
+    if paths.transaction_path.exists() && !recovering {
+        bail!(
+            "an unfinished Skiller transaction exists at {}; run `skiller doctor{} --repair`",
+            paths.transaction_path.display(),
+            if scope.is_global() { " -g" } else { "" }
+        );
+    }
     let previous: InstalledState = read_json_or_default(&paths.state_path)?;
-    validate_schema(previous.version, "installed state")?;
+    validate_installed_state(previous.version)?;
     validate_owned_state(&previous, paths.state_prefix)?;
     let resolved = resolve_manifest(manifest, catalogs, scope.is_global())?;
 
+    ensure_real_dir(
+        paths
+            .work_root
+            .parent()
+            .context("managed work root has no parent")?,
+    )?;
     ensure_real_dir(&paths.work_root)?;
     let staging_root = paths
         .work_root
@@ -90,6 +138,8 @@ pub fn install_with_catalogs(
         safe_remove_owned_dir(&prepared_root, &paths.work_root)?;
         ensure_real_dir(&staging_root)?;
         ensure_real_dir(&prepared_root.join("skills"))?;
+        write_work_marker(&staging_root)?;
+        write_work_marker(&prepared_root)?;
         Ok(())
     })();
     if let Err(error) = setup {
@@ -103,51 +153,80 @@ pub fn install_with_catalogs(
         if migrate {
             unlink_legacy_skill_roots(&paths.command_root, scope.is_global())?;
         } else {
-            refuse_unowned_conflicts(&paths.command_root, scope.is_global(), &previous, &resolved)?;
+            refuse_unowned_conflicts(
+                &paths.command_root,
+                scope.is_global(),
+                &previous,
+                &resolved,
+                recovery_owned,
+            )?;
         }
+        let desired_names: BTreeSet<_> = resolved
+            .iter()
+            .map(|skill| skill.installed_name.clone())
+            .collect();
+        let mut removed: BTreeSet<_> = previous
+            .skills
+            .values()
+            .filter(|skill| !desired_names.contains(&skill.installed_name))
+            .map(|skill| skill.installed_name.clone())
+            .collect();
+        removed.extend(
+            recovery_owned
+                .iter()
+                .filter(|name| !desired_names.contains(*name))
+                .cloned(),
+        );
+        let mut journal = TransactionJournal {
+            v: 1,
+            scope: if scope.is_global() { "g" } else { "p" }.to_owned(),
+            phase: TransactionPhase::P,
+            config: manifest_fingerprint(manifest)?,
+            desired: desired_names.iter().cloned().collect(),
+            remove: removed.iter().cloned().collect(),
+        };
+        write_json_atomic_compact(&paths.transaction_path, &journal)?;
         run_vercel_install(
             &paths.command_root,
             &prepared_root,
             &resolved,
             scope.is_global(),
         )?;
-        verify_installation(&paths.target_root, &resolved)?;
-
-        let desired_names: BTreeSet<_> = resolved
-            .iter()
-            .map(|skill| skill.installed_name.as_str())
-            .collect();
-        let removed: Vec<_> = previous
-            .skills
-            .values()
-            .filter(|skill| !desired_names.contains(skill.installed_name.as_str()))
-            .map(|skill| skill.installed_name.clone())
-            .collect();
-        run_vercel_remove(&paths.command_root, &removed, scope.is_global())?;
+        journal.phase = TransactionPhase::I;
+        write_json_atomic_compact(&paths.transaction_path, &journal)?;
+        verify_installation(&paths.command_root, scope.is_global(), &resolved)?;
+        journal.phase = TransactionPhase::V;
+        write_json_atomic_compact(&paths.transaction_path, &journal)?;
+        run_vercel_remove(
+            &paths.command_root,
+            &removed.into_iter().collect::<Vec<_>>(),
+            scope.is_global(),
+        )?;
+        journal.phase = TransactionPhase::C;
+        write_json_atomic_compact(&paths.transaction_path, &journal)?;
 
         let next = InstalledState {
-            version: crate::model::SCHEMA_VERSION,
+            version: INSTALLED_STATE_VERSION,
             skills: resolved
                 .iter()
                 .map(|skill| {
                     (
                         skill.key.clone(),
                         InstalledSkill {
-                            catalog: skill.catalog.alias.clone(),
-                            source_skill: skill.source_name.clone(),
                             installed_name: skill.installed_name.clone(),
-                            path: format!("{}/{}", paths.state_prefix, skill.installed_name),
                             mode: skill.mode,
                             gitignore: skill.gitignore,
+                            legacy_path: None,
                         },
                     )
                 })
                 .collect(),
         };
-        write_json_atomic(&paths.state_path, &next)?;
+        write_json_atomic_compact(&paths.state_path, &next)?;
         if let InstallScope::Project(project_root) = &scope {
             update_gitignore(project_root, &next)?;
         }
+        remove_transaction(&paths.transaction_path)?;
         Ok(())
     })();
 
@@ -188,12 +267,12 @@ pub fn install_with_catalogs(
     Ok(())
 }
 
-fn install_paths(scope: &InstallScope) -> Result<InstallPaths> {
+pub(crate) fn install_paths(scope: &InstallScope) -> Result<InstallPaths> {
     match scope {
         InstallScope::Project(project_root) => Ok(InstallPaths {
             state_path: project_root.join(".skiller/installed.json"),
+            transaction_path: project_root.join(".skiller/transaction.json"),
             work_root: project_root.join(".skiller"),
-            target_root: project_root.join(".agents/skills"),
             command_root: project_root.clone(),
             state_prefix: ".agents/skills",
         }),
@@ -205,8 +284,8 @@ fn install_paths(scope: &InstallScope) -> Result<InstallPaths> {
                 .to_owned();
             Ok(InstallPaths {
                 state_path: global_state_path()?,
+                transaction_path: crate::paths::state_root()?.join("transaction.json"),
                 work_root: cache_root()?.join("install"),
-                target_root: global_skills_root()?,
                 command_root: home,
                 state_prefix: ".agents/skills",
             })
@@ -214,7 +293,7 @@ fn install_paths(scope: &InstallScope) -> Result<InstallPaths> {
     }
 }
 
-fn resolve_manifest<'a>(
+pub(crate) fn resolve_manifest<'a>(
     manifest: &ProjectConfig,
     catalogs: &'a BTreeMap<String, CatalogIndex>,
     global_scope: bool,
@@ -431,6 +510,31 @@ fn vercel_command() -> Command {
     command
 }
 
+pub(crate) fn manifest_fingerprint(manifest: &ProjectConfig) -> Result<String> {
+    let bytes = serde_json::to_vec(manifest)?;
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("{hash:016x}"))
+}
+
+pub(crate) fn remove_transaction(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!(
+                "refusing to remove invalid transaction journal: {}",
+                path.display()
+            )
+        }
+        Ok(_) => std::fs::remove_file(path)
+            .with_context(|| format!("removing transaction journal {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
 fn run_command(mut command: Command, action: &str) -> Result<()> {
     let output = command
         .output()
@@ -445,7 +549,19 @@ fn run_command(mut command: Command, action: &str) -> Result<()> {
     Ok(())
 }
 
-fn projection_roots(command_root: &Path, global_scope: bool) -> Vec<PathBuf> {
+pub(crate) fn required_projection_roots(command_root: &Path, global_scope: bool) -> [PathBuf; 3] {
+    [
+        command_root.join(".agents/skills"),
+        command_root.join(".claude/skills"),
+        command_root.join(if global_scope {
+            ".pi/agent/skills"
+        } else {
+            ".pi/skills"
+        }),
+    ]
+}
+
+pub(crate) fn projection_roots(command_root: &Path, global_scope: bool) -> Vec<PathBuf> {
     let relative_roots: &[&str] = if global_scope {
         &[
             ".agents/skills",
@@ -498,12 +614,14 @@ fn refuse_unowned_conflicts(
     global_scope: bool,
     previous: &InstalledState,
     resolved: &[ResolvedSkill<'_>],
+    recovery_owned: &BTreeSet<String>,
 ) -> Result<()> {
-    let owned: BTreeSet<_> = previous
+    let mut owned: BTreeSet<_> = previous
         .skills
         .values()
         .map(|skill| skill.installed_name.as_str())
         .collect();
+    owned.extend(recovery_owned.iter().map(String::as_str));
     let roots = projection_roots(command_root, global_scope);
     for skill in resolved {
         let conflict = roots
@@ -520,24 +638,41 @@ fn refuse_unowned_conflicts(
     Ok(())
 }
 
-fn verify_installation(target_root: &Path, resolved: &[ResolvedSkill<'_>]) -> Result<()> {
-    for skill in resolved {
-        let path = target_root.join(&skill.installed_name).join("SKILL.md");
-        if !path.is_file() {
-            bail!("Vercel Skills did not install {}", path.display());
+fn verify_installation(
+    command_root: &Path,
+    global_scope: bool,
+    resolved: &[ResolvedSkill<'_>],
+) -> Result<()> {
+    for root in required_projection_roots(command_root, global_scope) {
+        for skill in resolved {
+            let path = root.join(&skill.installed_name).join("SKILL.md");
+            if !path.is_file() {
+                bail!("Vercel Skills did not install {}", path.display());
+            }
         }
     }
     Ok(())
 }
 
-fn validate_owned_state(state: &InstalledState, prefix: &str) -> Result<()> {
-    for skill in state.skills.values() {
-        let expected = format!("{prefix}/{}", skill.installed_name);
-        if skill.path != expected || !crate::model::valid_name(&skill.installed_name) {
+fn write_work_marker(root: &Path) -> Result<()> {
+    std::fs::write(root.join(".skiller-owned"), b"1\n")
+        .with_context(|| format!("marking owned work directory {}", root.display()))
+}
+
+pub(crate) fn validate_owned_state(state: &InstalledState, prefix: &str) -> Result<()> {
+    for (key, skill) in &state.skills {
+        split_key(key)?;
+        if !crate::model::valid_name(&skill.installed_name) {
             bail!(
-                "installed state contains an unsafe owned path: {}",
-                skill.path
+                "installed state contains an unsafe owned name: {}",
+                skill.installed_name
             );
+        }
+        if let Some(path) = &skill.legacy_path {
+            let expected = format!("{prefix}/{}", skill.installed_name);
+            if path != &expected {
+                bail!("installed state contains an unsafe owned path: {path}");
+            }
         }
     }
     Ok(())
@@ -678,6 +813,57 @@ mod tests {
     #[test]
     fn absent_global_selection_is_supported() {
         assert!(GlobalConfig::default().skills.is_empty());
+    }
+
+    #[test]
+    fn verification_requires_universal_claude_and_pi_projections() {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/verify-projections");
+        let _ = std::fs::remove_dir_all(&base);
+        let catalog = catalog(true);
+        let skill = ResolvedSkill {
+            key: "pyg/root".to_owned(),
+            catalog: &catalog,
+            source_name: "root".to_owned(),
+            installed_name: "root-engineering".to_owned(),
+            mode: EffectiveMode::Enable,
+            gitignore: false,
+        };
+        for root in required_projection_roots(&base, true) {
+            std::fs::create_dir_all(root.join("root-engineering")).unwrap();
+            std::fs::write(root.join("root-engineering/SKILL.md"), "---\n---\n").unwrap();
+        }
+        verify_installation(&base, true, &[skill]).unwrap();
+        std::fs::remove_file(base.join(".claude/skills/root-engineering/SKILL.md")).unwrap();
+        assert!(verify_installation(&base, true, &[]).is_ok());
+        let skill = ResolvedSkill {
+            key: "pyg/root".to_owned(),
+            catalog: &catalog,
+            source_name: "root".to_owned(),
+            installed_name: "root-engineering".to_owned(),
+            mode: EffectiveMode::Enable,
+            gitignore: false,
+        };
+        assert!(verify_installation(&base, true, &[skill]).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn transaction_journal_is_compact_and_phase_ordered() {
+        let journal = TransactionJournal {
+            v: 1,
+            scope: "g".to_owned(),
+            phase: TransactionPhase::V,
+            config: "abc".to_owned(),
+            desired: vec!["learn-learning".to_owned()],
+            remove: vec!["digest-knowledge".to_owned()],
+        };
+        assert_eq!(
+            serde_json::to_string(&journal).unwrap(),
+            r#"{"v":1,"scope":"g","phase":"v","config":"abc","desired":["learn-learning"],"remove":["digest-knowledge"]}"#
+        );
+        assert!(TransactionPhase::I < TransactionPhase::V);
     }
 
     #[test]

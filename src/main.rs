@@ -1,6 +1,7 @@
 mod catalog;
 mod config_tui;
 mod config_ui;
+mod doctor;
 mod installer;
 mod manual;
 mod model;
@@ -50,6 +51,21 @@ enum Command {
         /// Set project Git-ignore state as catalog/name=true|false
         #[arg(long, value_name = "SKILL=BOOL")]
         set_gitignore: Vec<String>,
+    },
+    /// Diagnose and explicitly repair catalog-managed configuration and installations
+    Doctor {
+        /// Diagnose global state instead of the current project
+        #[arg(short = 'g', long)]
+        global: bool,
+        /// Print a compact machine-readable report
+        #[arg(long, conflicts_with = "repair")]
+        print: bool,
+        /// Repair only deterministic Skiller-owned state
+        #[arg(long)]
+        repair: bool,
+        /// Confirm repair without prompting
+        #[arg(long, requires = "repair")]
+        yes: bool,
     },
     /// Reconcile catalog-managed skills through Vercel Skills
     Install {
@@ -123,6 +139,19 @@ fn main() -> Result<()> {
             };
             config_ui::configure(scope, print, &set, &set_gitignore)
         }
+        Command::Doctor {
+            global,
+            print,
+            repair,
+            yes,
+        } => {
+            let scope = if global {
+                installer::InstallScope::Global
+            } else {
+                installer::InstallScope::Project(paths::project_root()?)
+            };
+            doctor::run(scope, print, repair, yes)
+        }
         Command::Install { global, migrate } => {
             let scope = if global {
                 installer::InstallScope::Global
@@ -137,6 +166,13 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_requires_repair_for_yes_and_separates_print() {
+        assert!(Cli::try_parse_from(["skiller", "doctor", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["skiller", "doctor", "--repair", "--print"]).is_err());
+        assert!(Cli::try_parse_from(["skiller", "doctor", "-g", "--repair", "--yes"]).is_ok());
+    }
 
     #[test]
     fn catalog_add_skill_requires_one_eligibility_flag() {

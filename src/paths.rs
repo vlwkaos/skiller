@@ -84,6 +84,31 @@ where
     }
 }
 
+pub fn validate_managed_json_path(path: &Path) -> Result<()> {
+    let parent = path.parent().context("managed JSON path has no parent")?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            bail!(
+                "managed state parent must be a real directory: {}",
+                parent.display()
+            )
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", parent.display()));
+        }
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!("managed state must be a real file: {}", path.display())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -91,6 +116,14 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json_atomic_bytes(path, serde_json::to_vec_pretty(value)?)
+}
+
+pub fn write_json_atomic_compact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_json_atomic_bytes(path, serde_json::to_vec(value)?)
+}
+
+fn write_json_atomic_bytes(path: &Path, bytes: Vec<u8>) -> Result<()> {
     let parent = path.parent().context("JSON path has no parent")?;
     ensure_real_dir(parent)?;
     if let Ok(metadata) = std::fs::symlink_metadata(path)
@@ -104,7 +137,6 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         std::process::id(),
         TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let bytes = serde_json::to_vec_pretty(value)?;
     let write_result = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -243,6 +275,24 @@ fn home_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_state_rejects_symlinked_file_and_parent() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/managed-state-symlink");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        std::fs::write(base.join("real/state.json"), "{}").unwrap();
+        symlink(base.join("real/state.json"), base.join("linked.json")).unwrap();
+        assert!(validate_managed_json_path(&base.join("linked.json")).is_err());
+        symlink(base.join("real"), base.join("linked-parent")).unwrap();
+        assert!(validate_managed_json_path(&base.join("linked-parent/state.json")).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn child_output_strips_terminal_controls() {

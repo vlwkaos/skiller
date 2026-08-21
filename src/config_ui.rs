@@ -8,7 +8,8 @@ use serde::Serialize;
 use crate::catalog::{CatalogIndex, load_global_config, sync_registered_catalogs};
 use crate::installer::{InstallScope, install_with_catalogs};
 use crate::model::{
-    EffectiveMode, InstalledState, ProjectConfig, SelectionMode, SkillSelection, validate_schema,
+    EffectiveMode, InstalledState, ProjectConfig, SelectionMode, SkillSelection,
+    validate_installed_state, validate_schema,
 };
 use crate::paths::{
     global_config_path, global_skills_root, global_state_path, read_json_or_default,
@@ -75,7 +76,7 @@ pub fn configure(
     };
     validate_schema(manifest.version, "skill config")?;
     let state: InstalledState = read_json_or_default(&state_path)?;
-    validate_schema(state.version, "installed state")?;
+    validate_installed_state(state.version)?;
     let rows = config_rows(
         &catalogs,
         &state,
@@ -436,12 +437,10 @@ mod tests {
     #[test]
     fn stale_unpostfixed_state_does_not_match_a_postfixed_row() {
         let installed = InstalledSkill {
-            catalog: "pyg".to_owned(),
-            source_skill: "develop".to_owned(),
             installed_name: "develop".to_owned(),
-            path: ".agents/skills/develop".to_owned(),
             mode: EffectiveMode::Enable,
             gitignore: false,
+            legacy_path: None,
         };
         assert!(!installed_name_is_current(
             &installed,

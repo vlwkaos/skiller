@@ -321,6 +321,7 @@ fn scan_catalog(alias: &str, source: &str, root: &Path) -> Result<CatalogIndex> 
         }
     }
     validate_dependencies(&skills)?;
+    validate_renames(&metadata, &skills)?;
     Ok(CatalogIndex {
         alias: alias.to_owned(),
         source: source.to_owned(),
@@ -441,6 +442,51 @@ fn scalar_value(lines: &[&str], index: usize, value: &str) -> Option<String> {
     Some(value.trim_matches(['\'', '"']).to_owned())
 }
 
+fn validate_renames(
+    metadata: &CatalogMetadata,
+    skills: &BTreeMap<String, CatalogSkill>,
+) -> Result<()> {
+    for (old, new) in &metadata.renames {
+        if !valid_name(old) || !valid_name(new) {
+            bail!("catalog rename must use valid skill names: {old} -> {new}");
+        }
+        if skills.contains_key(old) {
+            bail!("catalog rename source still exists as a skill: {old}");
+        }
+    }
+    for start in metadata.renames.keys() {
+        let mut path = Vec::new();
+        let mut current = start.as_str();
+        while let Some(next) = metadata.renames.get(current) {
+            if let Some(index) = path.iter().position(|name| *name == current) {
+                let mut cycle = path[index..].to_vec();
+                cycle.push(current);
+                bail!("catalog rename cycle: {}", cycle.join(" -> "));
+            }
+            path.push(current);
+            current = next;
+        }
+        if !skills.contains_key(current) {
+            path.push(current);
+            bail!(
+                "catalog rename has no current target: {}",
+                path.join(" -> ")
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn resolve_rename(catalog: &CatalogIndex, name: &str) -> Option<String> {
+    let mut current = name;
+    let mut changed = false;
+    while let Some(next) = catalog.metadata.renames.get(current) {
+        current = next;
+        changed = true;
+    }
+    changed.then(|| current.to_owned())
+}
+
 fn validate_dependencies(skills: &BTreeMap<String, CatalogSkill>) -> Result<()> {
     for skill in skills.values() {
         for dependency in &skill.requires {
@@ -550,6 +596,30 @@ mod tests {
         assert_eq!(
             validate_dependencies(&indirect).unwrap_err().to_string(),
             "catalog dependency cycle: a -> b -> c -> a"
+        );
+    }
+
+    #[test]
+    fn catalog_renames_require_acyclic_paths_to_current_skills() {
+        let skills = BTreeMap::from([("learn".to_owned(), dependency_skill("learn", &[]))]);
+        let mut metadata = CatalogMetadata::default();
+        metadata
+            .renames
+            .insert("digest".to_owned(), "teach".to_owned());
+        metadata
+            .renames
+            .insert("teach".to_owned(), "learn".to_owned());
+        validate_renames(&metadata, &skills).unwrap();
+
+        metadata.renames = BTreeMap::from([
+            ("digest".to_owned(), "teach".to_owned()),
+            ("teach".to_owned(), "digest".to_owned()),
+        ]);
+        assert_eq!(
+            validate_renames(&metadata, &skills)
+                .unwrap_err()
+                .to_string(),
+            "catalog rename cycle: digest -> teach -> digest"
         );
     }
 
