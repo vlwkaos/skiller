@@ -20,7 +20,7 @@ skiller migrate --plan migration.json --check
 skiller migrate --plan migration.json --apply [--yes]
 ```
 
-`catalog configure` registers or updates canonical source, ref, and optional explicit owner checkout. `config` edits desired selection. `update --check` reports published and unpublished authoring differences without installation. `update` requires confirmation and installs canonical catalog content. `install` performs full canonical reconciliation. `doctor` diagnoses and explicitly repairs owned state. `migrate` guides legacy skills into a writable catalog, creates configuration, and optionally installs and cleans exact approved legacy names.
+`catalog configure` registers or updates canonical source, ref, and optional explicit owner checkout. Local source and authoring paths may start with `~/` for portable dotfiles configuration. `config` edits desired selection. `update --check` reports published and unpublished authoring differences without installation. `update` requires confirmation and installs canonical catalog content. `install` performs full canonical reconciliation. `doctor` diagnoses and explicitly repairs owned state. `migrate` guides legacy skills into a writable catalog, creates configuration, and optionally installs and cleans exact approved legacy names.
 
 ## Configuration
 

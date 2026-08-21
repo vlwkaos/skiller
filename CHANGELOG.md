@@ -1,3 +1,9 @@
+## [0.8.2] - 2026-08-21
+
+### Changed
+
+- Expand `~` in local canonical and authoring catalog paths for portable dotfiles configuration.
+
 ## [0.8.1] - 2026-08-21
 
 ### Changed

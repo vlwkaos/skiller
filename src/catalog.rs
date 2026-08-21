@@ -9,8 +9,9 @@ use crate::model::{
     validate_alias, validate_schema,
 };
 use crate::paths::{
-    cache_root, copy_tree, ensure_real_dir, global_config_path, read_json, read_json_or_default,
-    safe_remove_owned_dir, sanitize_child_output, write_global_config, write_json_atomic,
+    cache_root, copy_tree, ensure_real_dir, expand_home_path, global_config_path, read_json,
+    read_json_or_default, safe_remove_owned_dir, sanitize_child_output, write_global_config,
+    write_json_atomic,
 };
 
 #[derive(Debug, Clone)]
@@ -147,7 +148,8 @@ pub fn configure_catalog(
 }
 
 fn validate_authoring_root(alias: &str, root: &Path) -> Result<PathBuf> {
-    let metadata = std::fs::symlink_metadata(root)
+    let root = expand_home_path(&root.to_string_lossy())?;
+    let metadata = std::fs::symlink_metadata(&root)
         .with_context(|| format!("inspecting authoring root for catalog {alias}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         bail!("catalog {alias} authoring root must be a real directory");
@@ -308,7 +310,7 @@ pub fn sync_registered_catalogs_cached(config: &GlobalConfig) -> Result<CatalogS
         if registration.r#ref.as_deref().is_some_and(str::is_empty) {
             bail!("catalog {alias} ref cannot be empty");
         }
-        let source_path = PathBuf::from(&registration.source);
+        let source_path = expand_home_path(&registration.source)?;
         if source_path.exists() && registration.r#ref.is_none() {
             let root = source_path
                 .canonicalize()
@@ -464,7 +466,7 @@ fn sync_catalog_with_policy(
             "catalog {alias} ref cannot be empty"
         )));
     }
-    let source_path = PathBuf::from(&registration.source);
+    let source_path = expand_home_path(&registration.source).map_err(SyncError::Invalid)?;
     let (root, refreshed) = if source_path.exists() && registration.r#ref.is_none() {
         (
             source_path.canonicalize().map_err(|error| {

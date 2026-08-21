@@ -293,9 +293,31 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME is not configured")
 }
 
+pub(crate) fn expand_home_path(value: &str) -> Result<PathBuf> {
+    if value == "~" {
+        return home_dir();
+    }
+    if let Some(relative) = value.strip_prefix("~/") {
+        return Ok(home_dir()?.join(relative));
+    }
+    Ok(PathBuf::from(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_relative_paths_expand_portably() {
+        assert_eq!(
+            expand_home_path("~/dotfiles").unwrap(),
+            home_dir().unwrap().join("dotfiles")
+        );
+        assert_eq!(
+            expand_home_path("relative/path").unwrap(),
+            PathBuf::from("relative/path")
+        );
+    }
 
     #[cfg(unix)]
     #[test]
