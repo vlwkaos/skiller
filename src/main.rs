@@ -7,6 +7,7 @@ mod manual;
 mod migration;
 mod model;
 mod paths;
+mod update;
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -89,6 +90,21 @@ enum Command {
         #[arg(long, requires = "apply")]
         yes: bool,
     },
+    /// Check for or explicitly install catalog skill updates
+    Update {
+        /// Check global skills instead of the current project
+        #[arg(short = 'g', long)]
+        global: bool,
+        /// Refresh catalogs and report updates without installing
+        #[arg(long, conflicts_with = "yes")]
+        check: bool,
+        /// Print a compact machine-readable update report
+        #[arg(long, requires = "check")]
+        json: bool,
+        /// Confirm update installation without prompting
+        #[arg(long, conflicts_with = "check")]
+        yes: bool,
+    },
     /// Reconcile catalog-managed skills through Vercel Skills
     Install {
         /// Install globally instead of into the current project
@@ -101,6 +117,35 @@ enum Command {
 enum CatalogCommand {
     /// Copy one skill into a catalog and register its scope and eligibility
     AddSkill(AddSkillArgs),
+    /// Configure canonical and writable sources for a registered catalog
+    Configure(CatalogConfigureArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("catalog_change")
+        .required(true)
+        .multiple(true)
+        .args(["source", "ref", "clear_ref", "authoring_root", "clear_authoring_root"])
+))]
+struct CatalogConfigureArgs {
+    /// Registered catalog alias
+    alias: String,
+    /// Canonical Git or local source used by consumers
+    #[arg(long)]
+    source: Option<String>,
+    /// Branch, tag, or commit selected from the canonical source
+    #[arg(long, value_name = "REF", conflicts_with = "clear_ref")]
+    r#ref: Option<String>,
+    /// Remove the configured canonical ref
+    #[arg(long)]
+    clear_ref: bool,
+    /// Explicit writable checkout used only for catalog authoring
+    #[arg(long, conflicts_with = "clear_authoring_root")]
+    authoring_root: Option<PathBuf>,
+    /// Remove the configured writable authoring checkout
+    #[arg(long)]
+    clear_authoring_root: bool,
 }
 
 #[derive(Debug, Args)]
@@ -132,19 +177,27 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::AddCatalog { alias, source } => catalog::add_catalog(&alias, &source),
-        Command::Catalog {
-            command: CatalogCommand::AddSkill(args),
-        } => catalog::add_skill(
-            &args.root,
-            &args.source,
-            &args.scope,
-            if args.global {
-                catalog::CatalogEligibility::Global
-            } else {
-                debug_assert!(args.project);
-                catalog::CatalogEligibility::Project
-            },
-        ),
+        Command::Catalog { command } => match command {
+            CatalogCommand::AddSkill(args) => catalog::add_skill(
+                &args.root,
+                &args.source,
+                &args.scope,
+                if args.global {
+                    catalog::CatalogEligibility::Global
+                } else {
+                    debug_assert!(args.project);
+                    catalog::CatalogEligibility::Project
+                },
+            ),
+            CatalogCommand::Configure(args) => catalog::configure_catalog(
+                &args.alias,
+                args.source.as_deref(),
+                args.r#ref.as_deref(),
+                args.clear_ref,
+                args.authoring_root.as_deref(),
+                args.clear_authoring_root,
+            ),
+        },
         Command::Config {
             global,
             print,
@@ -184,6 +237,19 @@ fn main() -> Result<()> {
             (None, None) => migration::interactive(),
             (Some(_), Some(_)) => unreachable!("Clap rejects conflicting migration inputs"),
         },
+        Command::Update {
+            global,
+            check,
+            json,
+            yes,
+        } => {
+            let scope = if global {
+                installer::InstallScope::Global
+            } else {
+                installer::InstallScope::Project(paths::project_root()?)
+            };
+            update::run(scope, check, json, yes)
+        }
         Command::Install { global } => {
             let scope = if global {
                 installer::InstallScope::Global
@@ -231,6 +297,33 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn update_check_is_read_only_and_json_is_check_only() {
+        assert!(Cli::try_parse_from(["skiller", "update", "--check", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["skiller", "update", "--check", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["skiller", "update", "--json"]).is_err());
+    }
+
+    #[test]
+    fn catalog_configure_unifies_registration_and_owner_checkout() {
+        assert!(
+            Cli::try_parse_from([
+                "skiller",
+                "catalog",
+                "configure",
+                "private",
+                "--source",
+                "git@example/catalog.git",
+                "--ref",
+                "main",
+                "--authoring-root",
+                "/catalog"
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["skiller", "catalog", "configure", "private"]).is_err());
     }
 
     #[test]

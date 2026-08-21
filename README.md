@@ -5,10 +5,13 @@ Declarative Agent Skill catalog, configuration, migration, and installation over
 ## Commands
 
 ```bash
-skiller add-catalog <alias> <source>
+skiller catalog configure <alias> --source <source> [--ref <ref>] [--authoring-root <path>]
+skiller add-catalog <alias> <source> # compatibility alias
 skiller catalog add-skill --root <catalog> --source <skill> --scope <scope> --global|--project
 skiller config [-g] [--print] [--set catalog/name=enable|manual|off]
 skiller config [-g] --agent <agent> [--agent <agent>...]
+skiller update [-g] --check [--json]
+skiller update [-g] [--yes]
 skiller install [-g]
 skiller doctor [-g] [--print|--repair [--yes]]
 skiller migrate
@@ -17,7 +20,7 @@ skiller migrate --plan migration.json --check
 skiller migrate --plan migration.json --apply [--yes]
 ```
 
-`config` edits desired selection. `install` reconciles it. `doctor` diagnoses and explicitly repairs owned state. `migrate` guides legacy skills into a writable catalog, creates configuration, and optionally installs and cleans exact approved legacy names.
+`catalog configure` registers or updates canonical source, ref, and optional explicit owner checkout. `config` edits desired selection. `update --check` reports published and unpublished authoring differences without installation. `update` requires confirmation and installs canonical catalog content. `install` performs full canonical reconciliation. `doctor` diagnoses and explicitly repairs owned state. `migrate` guides legacy skills into a writable catalog, creates configuration, and optionally installs and cleans exact approved legacy names.
 
 ## Configuration
 
@@ -27,7 +30,11 @@ Global configuration is `~/.config/skiller/config.json`. Project configuration i
 {
   "version": 1,
   "catalogs": {
-    "pyg": { "source": "vlwkaos/skills" }
+    "pyg": {
+      "source": "git@github.com:vlwkaos/skills.git",
+      "ref": "main",
+      "authoring_root": "/explicit/local/checkout"
+    }
   },
   "agents": ["universal", "claude-code", "pi"],
   "skills": {
@@ -37,7 +44,7 @@ Global configuration is `~/.config/skiller/config.json`. Project configuration i
 }
 ```
 
-At least one Vercel agent is required. Agent names pass to `skills@1.5.23`, which performs final validation and placement. Project configuration omits `catalogs` but has the same `agents` and `skills` fields.
+`source` and optional `ref` define canonical consumer content. `authoring_root` is an optional explicit writable checkout used only to detect unpublished owner changes; installation always uses canonical content. At least one Vercel agent is required. Agent names pass to `skills@1.5.23`, which performs final validation and placement. Project configuration omits `catalogs` but has the same `agents` and `skills` fields.
 
 Enabled skills allow agent and human invocation. Manual skills are human-only unless required. Unselected dependencies are agent-only. Dependency reachability never changes configured selection.
 
@@ -70,7 +77,8 @@ Dependencies use comma-separated `metadata.skiller.requires`. Missing dependenci
 - Doctor is read-only unless `--repair` is supplied.
 - Noninteractive mutation requires `--yes`.
 - Skiller removes only prior ownership or exact validated migration/recovery names.
-- Installed state is compact schema 2 under the XDG state directory.
+- Installed state is compact schema 3 under the XDG state directory and records deterministic projected-content digests.
+- Catalog checks may refresh caches but never install; updates remain confirmation-gated.
 - Interrupted installation retains an owned transaction journal for Doctor recovery.
 
 The guided migration procedure is also available as `skills/skiller-migrate/SKILL.md` in this repository.

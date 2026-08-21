@@ -345,6 +345,8 @@ fn apply_plan(plan: &MigrationPlan) -> Result<()> {
                 plan.catalog.alias.clone(),
                 CatalogRegistration {
                     source: plan.catalog.source.clone(),
+                    r#ref: None,
+                    authoring_root: Some(plan.catalog.root.display().to_string()),
                 },
             );
         }

@@ -438,6 +438,7 @@ mod tests {
             installed_name: "develop-engineering".to_owned(),
             mode: EffectiveMode::Enable,
             gitignore: false,
+            digest: None,
             legacy_path: None,
         };
         assert!(!installed_name_is_current(&installed, "develop"));
@@ -450,6 +451,7 @@ mod tests {
             alias: "pyg".to_owned(),
             source: "test".to_owned(),
             root: PathBuf::from("."),
+            revision: None,
             metadata: CatalogMetadata::default(),
             skills: BTreeMap::from([
                 (
@@ -457,6 +459,7 @@ mod tests {
                     CatalogSkill {
                         name: "global".to_owned(),
                         description: "Global".to_owned(),
+                        digest: "global".to_owned(),
                         scope: None,
                         installed_name: "global-scope".to_owned(),
                         global: true,
@@ -468,6 +471,7 @@ mod tests {
                     CatalogSkill {
                         name: "project".to_owned(),
                         description: "Project".to_owned(),
+                        digest: "project".to_owned(),
                         scope: None,
                         installed_name: "project-scope".to_owned(),
                         global: false,

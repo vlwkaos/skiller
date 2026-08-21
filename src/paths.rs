@@ -123,6 +123,27 @@ pub fn write_json_atomic_compact<T: Serialize>(path: &Path, value: &T) -> Result
     write_json_atomic_bytes(path, serde_json::to_vec(value)?)
 }
 
+pub fn write_json_exclusive_compact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let parent = path.parent().context("JSON path has no parent")?;
+    ensure_real_dir(parent)?;
+    let bytes = serde_json::to_vec(value)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("acquiring exclusive transaction {}", path.display()))?;
+    if let Err(error) = file
+        .write_all(&bytes)
+        .and_then(|_| file.write_all(b"\n"))
+        .and_then(|_| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(error).with_context(|| format!("writing {}", path.display()));
+    }
+    Ok(())
+}
+
 fn write_json_atomic_bytes(path: &Path, bytes: Vec<u8>) -> Result<()> {
     let parent = path.parent().context("JSON path has no parent")?;
     ensure_real_dir(parent)?;
@@ -292,6 +313,23 @@ mod tests {
         symlink(base.join("real"), base.join("linked-parent")).unwrap();
         assert!(validate_managed_json_path(&base.join("linked-parent/state.json")).is_err());
         std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn exclusive_json_write_acquires_once() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/exclusive-json/transaction.json");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        write_json_exclusive_compact(&path, &serde_json::json!({ "phase": "prepared" })).unwrap();
+        assert!(
+            write_json_exclusive_compact(&path, &serde_json::json!({ "phase": "other" })).is_err()
+        );
+        assert_eq!(
+            read_json::<serde_json::Value>(&path).unwrap()["phase"],
+            "prepared"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

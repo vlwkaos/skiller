@@ -253,6 +253,13 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
                         fixable: true,
                     });
                 }
+                Some(desired) if installed.digest.as_deref() != Some(&desired.digest) => {
+                    issues.push(DoctorIssue {
+                        code: "update-available",
+                        message: format!("{key} differs from the current catalog version"),
+                        fixable: true,
+                    });
+                }
                 Some(_) => {}
             }
         }
@@ -475,6 +482,7 @@ fn validate_transaction(
                 installed.installed_name == skill.installed_name
                     && installed.mode == skill.mode
                     && installed.gitignore == skill.gitignore
+                    && installed.digest.as_deref() == Some(&skill.digest)
             })
         });
     if journal.phase == TransactionPhase::C && state_is_current {
@@ -650,6 +658,7 @@ mod tests {
             alias: "pyg".to_owned(),
             source: "test".to_owned(),
             root: PathBuf::from("."),
+            revision: None,
             metadata: CatalogMetadata {
                 version: SCHEMA_VERSION,
                 scopes: BTreeMap::new(),
@@ -667,6 +676,7 @@ mod tests {
                 CatalogSkill {
                     name: "learn".to_owned(),
                     description: "Learn".to_owned(),
+                    digest: "learn".to_owned(),
                     scope: Some("learning".to_owned()),
                     installed_name: "learn".to_owned(),
                     global: true,

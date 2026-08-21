@@ -18,6 +18,7 @@ pub struct CatalogIndex {
     pub alias: String,
     pub source: String,
     pub root: PathBuf,
+    pub revision: Option<String>,
     pub metadata: CatalogMetadata,
     pub skills: BTreeMap<String, CatalogSkill>,
 }
@@ -26,6 +27,7 @@ pub struct CatalogIndex {
 pub struct CatalogSkill {
     pub name: String,
     pub description: String,
+    pub digest: String,
     pub scope: Option<String>,
     pub installed_name: String,
     pub global: bool,
@@ -48,26 +50,77 @@ pub fn load_global_config() -> Result<GlobalConfig> {
 }
 
 pub fn add_catalog(alias: &str, source: &str) -> Result<()> {
-    validate_alias(alias)?;
-    if source.trim().is_empty() {
-        bail!("catalog source cannot be empty");
-    }
-    let mut config = load_global_config()?;
+    let config = load_global_config()?;
     if config.catalogs.contains_key(alias) {
         bail!("catalog alias already exists: {alias}");
     }
+    configure_catalog(alias, Some(source), None, false, None, false)
+}
+
+pub fn configure_catalog(
+    alias: &str,
+    source: Option<&str>,
+    reference: Option<&str>,
+    clear_ref: bool,
+    authoring_root: Option<&Path>,
+    clear_authoring_root: bool,
+) -> Result<()> {
+    validate_alias(alias)?;
+    let mut config = load_global_config()?;
+    let existing = config.catalogs.get(alias).cloned();
+    let source = source
+        .map(str::to_owned)
+        .or_else(|| existing.as_ref().map(|value| value.source.clone()))
+        .with_context(|| format!("new catalog {alias} requires --source"))?;
+    if source.trim().is_empty() {
+        bail!("catalog source cannot be empty");
+    }
+    let configured_ref = if clear_ref {
+        None
+    } else {
+        reference
+            .map(str::to_owned)
+            .or_else(|| existing.as_ref().and_then(|value| value.r#ref.clone()))
+    };
+    let configured_authoring = if clear_authoring_root {
+        None
+    } else {
+        authoring_root
+            .map(|path| path.display().to_string())
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|value| value.authoring_root.clone())
+            })
+    };
+    if let Some(root) = &configured_authoring {
+        validate_authoring_root(alias, Path::new(root))?;
+    }
     let registration = CatalogRegistration {
-        source: source.to_owned(),
+        source,
+        r#ref: configured_ref,
+        authoring_root: configured_authoring,
     };
     let index = sync_catalog(alias, &registration)?;
     config.catalogs.insert(alias.to_owned(), registration);
     write_global_config(&config)?;
     println!(
-        "added catalog {alias}: {} skill{} from {source}",
+        "configured catalog {alias}: {} skill{} from {}",
         index.skills.len(),
-        if index.skills.len() == 1 { "" } else { "s" }
+        if index.skills.len() == 1 { "" } else { "s" },
+        index.source
     );
     Ok(())
+}
+
+fn validate_authoring_root(alias: &str, root: &Path) -> Result<PathBuf> {
+    let metadata = std::fs::symlink_metadata(root)
+        .with_context(|| format!("inspecting authoring root for catalog {alias}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("catalog {alias} authoring root must be a real directory");
+    }
+    root.canonicalize()
+        .with_context(|| format!("resolving authoring root for catalog {alias}"))
 }
 
 // ^ README.md#catalog-authoring owns the explicit checkout and eligibility boundary.
@@ -208,33 +261,121 @@ pub fn sync_registered_catalogs(config: &GlobalConfig) -> Result<BTreeMap<String
 }
 
 pub fn sync_catalog(alias: &str, registration: &CatalogRegistration) -> Result<CatalogIndex> {
+    sync_catalog_with_policy(alias, registration, false)
+}
+
+pub fn sync_registered_catalogs_noninteractive(
+    config: &GlobalConfig,
+) -> Result<BTreeMap<String, CatalogIndex>> {
+    config
+        .catalogs
+        .iter()
+        .map(|(alias, registration)| {
+            sync_catalog_with_policy(alias, registration, true)
+                .map(|catalog| (alias.clone(), catalog))
+        })
+        .collect()
+}
+
+pub fn sync_registered_authoring_catalogs(
+    config: &GlobalConfig,
+    canonical: &BTreeMap<String, CatalogIndex>,
+) -> Result<BTreeMap<String, CatalogIndex>> {
+    let mut catalogs = canonical.clone();
+    for (alias, registration) in &config.catalogs {
+        let Some(root) = &registration.authoring_root else {
+            continue;
+        };
+        let root = validate_authoring_root(alias, Path::new(root))?;
+        catalogs.insert(
+            alias.clone(),
+            scan_catalog(alias, &registration.source, &root)?,
+        );
+    }
+    Ok(catalogs)
+}
+
+fn sync_catalog_with_policy(
+    alias: &str,
+    registration: &CatalogRegistration,
+    noninteractive: bool,
+) -> Result<CatalogIndex> {
     validate_alias(alias)?;
+    if registration.r#ref.as_deref().is_some_and(str::is_empty) {
+        bail!("catalog {alias} ref cannot be empty");
+    }
     let source_path = PathBuf::from(&registration.source);
-    let root = if source_path.exists() {
+    let root = if source_path.exists() && registration.r#ref.is_none() {
         source_path
             .canonicalize()
             .with_context(|| format!("resolving catalog source {}", registration.source))?
     } else {
-        clone_catalog(alias, &registration.source)?
+        clone_catalog(alias, registration, noninteractive)?
     };
     scan_catalog(alias, &registration.source, &root)
 }
 
-fn clone_catalog(alias: &str, source: &str) -> Result<PathBuf> {
+fn clone_catalog(
+    alias: &str,
+    registration: &CatalogRegistration,
+    noninteractive: bool,
+) -> Result<PathBuf> {
     let catalogs_root = cache_root()?.join("catalogs");
     crate::paths::ensure_real_dir(&catalogs_root)?;
     let destination = catalogs_root.join(alias);
     safe_remove_owned_dir(&destination, &catalogs_root)?;
 
-    let candidates = clone_candidates(source);
+    let candidates = clone_candidates(&registration.source);
     let mut failures = Vec::new();
     for candidate in candidates {
-        let output = Command::new("git")
-            .args(["clone", "--depth", "1", &candidate])
+        let mut command = Command::new("git");
+        command.args(["clone", "--depth", "1"]);
+        let commit_ref = registration.r#ref.as_deref().is_some_and(|reference| {
+            reference.len() == 40 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        if let Some(reference) = &registration.r#ref
+            && !commit_ref
+        {
+            command.args(["--branch", reference, "--single-branch"]);
+        }
+        if noninteractive {
+            command.env("GIT_TERMINAL_PROMPT", "0").env(
+                "GIT_SSH_COMMAND",
+                "ssh -o BatchMode=yes -o ConnectTimeout=5",
+            );
+        }
+        let output = command
+            .arg(&candidate)
             .arg(&destination)
             .output()
-            .with_context(|| format!("starting git clone for {source}"))?;
+            .with_context(|| format!("starting git clone for {}", registration.source))?;
         if output.status.success() {
+            if commit_ref {
+                let reference = registration.r#ref.as_deref().expect("commit ref exists");
+                let mut fetch = Command::new("git");
+                fetch
+                    .args(["fetch", "--depth", "1", "origin", reference])
+                    .current_dir(&destination);
+                if noninteractive {
+                    fetch.env("GIT_TERMINAL_PROMPT", "0").env(
+                        "GIT_SSH_COMMAND",
+                        "ssh -o BatchMode=yes -o ConnectTimeout=5",
+                    );
+                }
+                let fetched = fetch.output()?;
+                let checked_out = fetched.status.success()
+                    && Command::new("git")
+                        .args(["checkout", "--detach", "FETCH_HEAD"])
+                        .current_dir(&destination)
+                        .output()?
+                        .status
+                        .success();
+                if !checked_out {
+                    failures.push(sanitize_child_output(&fetched.stderr));
+                    safe_remove_owned_dir(&destination, &catalogs_root)?;
+                    continue;
+                }
+            }
             return destination
                 .canonicalize()
                 .with_context(|| format!("resolving cloned catalog {alias}"));
@@ -243,7 +384,8 @@ fn clone_catalog(alias: &str, source: &str) -> Result<PathBuf> {
         safe_remove_owned_dir(&destination, &catalogs_root)?;
     }
     bail!(
-        "failed to clone catalog {source}: {}",
+        "failed to clone catalog {}: {}",
+        registration.source,
         failures.join(" | ").trim()
     )
 }
@@ -322,10 +464,12 @@ pub(crate) fn scan_catalog(alias: &str, source: &str, root: &Path) -> Result<Cat
     }
     validate_dependencies(&skills)?;
     validate_renames(&metadata, &skills)?;
+    let revision = git_revision(root)?;
     Ok(CatalogIndex {
         alias: alias.to_owned(),
         source: source.to_owned(),
         root: root.to_owned(),
+        revision,
         metadata,
         skills,
     })
@@ -366,12 +510,63 @@ fn read_skill_directory(directory: &Path, metadata: CatalogSkillMetadata) -> Res
         .unwrap_or_default();
     Ok(CatalogSkill {
         installed_name: installed_name(&name, metadata.scope.as_deref())?,
+        digest: directory_digest(directory)?,
         name,
         description,
         scope: metadata.scope,
         global: metadata.global,
         requires,
     })
+}
+
+fn git_revision(root: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("reading catalog revision from {}", root.display()))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let revision = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((!revision.is_empty()).then_some(revision))
+}
+
+fn directory_digest(root: &Path) -> Result<String> {
+    fn update(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    fn walk(root: &Path, current: &Path, hash: &mut u64) -> Result<()> {
+        let mut entries = std::fs::read_dir(current)
+            .with_context(|| format!("reading skill directory {}", current.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                bail!("skill source contains a symlink: {}", path.display());
+            }
+            let relative = path.strip_prefix(root).expect("walked path is below root");
+            update(hash, relative.to_string_lossy().as_bytes());
+            update(hash, &[0]);
+            if metadata.is_dir() {
+                update(hash, b"d");
+                walk(root, &path, hash)?;
+            } else if metadata.is_file() {
+                update(hash, b"f");
+                update(hash, &std::fs::read(&path)?);
+            }
+            update(hash, &[0xff]);
+        }
+        Ok(())
+    }
+    let mut hash = 0xcbf29ce484222325;
+    walk(root, root, &mut hash)?;
+    Ok(format!("{hash:016x}"))
 }
 
 pub fn installed_name(name: &str, _scope: Option<&str>) -> Result<String> {
@@ -570,6 +765,7 @@ mod tests {
         CatalogSkill {
             name: name.to_owned(),
             description: name.to_owned(),
+            digest: "test".to_owned(),
             scope: None,
             installed_name: name.to_owned(),
             global: true,
@@ -738,7 +934,7 @@ mod tests {
         let error = add_skill(&root, &source, "test", CatalogEligibility::Global)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("unsupported symlink"));
+        assert!(error.contains("symlink"));
         assert!(!root.join("skills/root").exists());
         assert!(
             !root

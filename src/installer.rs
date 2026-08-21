@@ -14,7 +14,7 @@ use crate::model::{
 use crate::paths::{
     cache_root, copy_tree, ensure_real_dir, global_skills_root, global_state_path, read_json,
     read_json_or_default, safe_remove_owned_dir, sanitize_child_output, validate_managed_json_path,
-    write_json_atomic_compact,
+    write_json_atomic_compact, write_json_exclusive_compact,
 };
 
 const VERCEL_SKILLS_PACKAGE: &str = "skills@1.5.23";
@@ -41,6 +41,7 @@ pub(crate) struct ResolvedSkill<'a> {
     pub(crate) installed_name: String,
     pub(crate) mode: EffectiveMode,
     pub(crate) gitignore: bool,
+    pub(crate) digest: String,
 }
 
 pub(crate) struct InstallPaths {
@@ -205,7 +206,11 @@ pub(crate) fn install_with_catalogs_recovery(
             desired: desired_names.iter().cloned().collect(),
             remove: removed.iter().cloned().collect(),
         };
-        write_json_atomic_compact(&paths.transaction_path, &journal)?;
+        if recovering {
+            write_json_atomic_compact(&paths.transaction_path, &journal)?;
+        } else {
+            write_json_exclusive_compact(&paths.transaction_path, &journal)?;
+        }
         run_vercel_install(
             &paths.command_root,
             &prepared_root,
@@ -249,6 +254,7 @@ pub(crate) fn install_with_catalogs_recovery(
                             installed_name: skill.installed_name.clone(),
                             mode: skill.mode,
                             gitignore: skill.gitignore,
+                            digest: Some(skill.digest.clone()),
                             legacy_path: None,
                         },
                     )
@@ -379,6 +385,7 @@ pub(crate) fn resolve_manifest<'a>(
         if let Some(other) = installed_names.insert(installed_name.clone(), key.clone()) {
             bail!("installed skill name collision: {other} and {key} both become {installed_name}");
         }
+        let digest = projected_digest(skill, &installed_name, mode);
         resolved.push(ResolvedSkill {
             key,
             catalog,
@@ -386,9 +393,37 @@ pub(crate) fn resolve_manifest<'a>(
             installed_name,
             mode,
             gitignore,
+            digest,
         });
     }
     Ok(resolved)
+}
+
+fn projected_digest(
+    skill: &crate::catalog::CatalogSkill,
+    installed_name: &str,
+    mode: EffectiveMode,
+) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mode = match mode {
+        EffectiveMode::Enable => "enable",
+        EffectiveMode::Manual => "manual",
+        EffectiveMode::Dependency => "dependency",
+    };
+    for value in [
+        skill.digest.as_str(),
+        installed_name,
+        skill.scope.as_deref().unwrap_or(""),
+        mode,
+    ] {
+        for byte in value.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn add_dependency_closure(
@@ -847,6 +882,7 @@ mod tests {
             alias: "pyg".to_owned(),
             source: "test".to_owned(),
             root: PathBuf::from("."),
+            revision: None,
             metadata: CatalogMetadata::default(),
             skills: BTreeMap::from([
                 (
@@ -854,6 +890,7 @@ mod tests {
                     CatalogSkill {
                         name: "root".to_owned(),
                         description: "Root".to_owned(),
+                        digest: "root".to_owned(),
                         scope: Some("engineering".to_owned()),
                         installed_name: "root".to_owned(),
                         global,
@@ -865,6 +902,7 @@ mod tests {
                     CatalogSkill {
                         name: "dependency".to_owned(),
                         description: "Dependency".to_owned(),
+                        digest: "dependency".to_owned(),
                         scope: Some("engineering".to_owned()),
                         installed_name: "dependency".to_owned(),
                         global,

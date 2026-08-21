@@ -1,3 +1,17 @@
+## [0.7.0] - 2026-08-21
+
+### Features
+
+- Add canonical catalog refs, explicit authoring checkouts, and unified `catalog configure` registration.
+- Add deterministic projected-skill digests and backward-compatible compact installed-state schema 3.
+- Add read-only JSON update checks that distinguish published catalog changes from unpublished authoring drafts.
+- Add confirmation-gated `skiller update`; installation always uses canonical catalog content.
+
+### Security
+
+- Make background update checks noninteractive and bound SSH connection attempts.
+- Keep authoring checkouts detection-only so unpublished skill behavior cannot install accidentally.
+
 ## [0.6.1] - 2026-08-21
 
 ### Fixed
