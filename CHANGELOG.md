@@ -1,3 +1,9 @@
+## [0.7.3] - 2026-08-21
+
+### Security
+
+- Replace a repository-specific test fixture with a neutral catalog alias.
+
 ## [0.7.2] - 2026-08-21
 
 ### Fixed
