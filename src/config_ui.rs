@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::catalog::{
     CatalogAvailability, CatalogIndex, CatalogStatus, load_global_config,
-    sync_registered_catalogs_resilient,
+    sync_registered_catalogs_cached, sync_registered_catalogs_resilient,
 };
 use crate::installer::InstallScope;
 use crate::model::{
@@ -72,7 +72,11 @@ pub fn configure(
     if global_config.catalogs.is_empty() {
         anyhow::bail!("no catalogs configured; run `skiller add-catalog <alias> <source>`");
     }
-    let sync = sync_registered_catalogs_resilient(&global_config)?;
+    let sync = if print_only {
+        sync_registered_catalogs_cached(&global_config)?
+    } else {
+        sync_registered_catalogs_resilient(&global_config)?
+    };
     let catalogs = sync.catalogs.clone();
     let (config_path, state_path, mut manifest) = match &scope {
         InstallScope::Project(project_root) => {

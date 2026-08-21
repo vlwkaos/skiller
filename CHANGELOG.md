@@ -1,3 +1,9 @@
+## [0.8.1] - 2026-08-21
+
+### Changed
+
+- Make `config --print` read synchronized local catalog state without network refresh.
+
 ## [0.8.0] - 2026-08-21
 
 ### Features

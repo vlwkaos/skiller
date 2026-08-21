@@ -301,6 +301,59 @@ pub fn sync_catalog(alias: &str, registration: &CatalogRegistration) -> Result<C
 
 /// Refresh every registration without prompting. Only source acquisition errors are
 /// downgraded: a reached catalog which fails validation remains an error.
+pub fn sync_registered_catalogs_cached(config: &GlobalConfig) -> Result<CatalogSync> {
+    let mut result = CatalogSync::default();
+    for (alias, registration) in &config.catalogs {
+        validate_alias(alias)?;
+        if registration.r#ref.as_deref().is_some_and(str::is_empty) {
+            bail!("catalog {alias} ref cannot be empty");
+        }
+        let source_path = PathBuf::from(&registration.source);
+        if source_path.exists() && registration.r#ref.is_none() {
+            let root = source_path
+                .canonicalize()
+                .with_context(|| format!("resolving catalog source {}", registration.source))?;
+            let catalog = scan_catalog(alias, &registration.source, &root)?;
+            result.catalogs.insert(alias.clone(), catalog.clone());
+            result.statuses.insert(
+                alias.clone(),
+                CatalogStatus {
+                    alias: alias.clone(),
+                    availability: CatalogAvailability::Available,
+                    warning: None,
+                    catalog: Some(catalog),
+                },
+            );
+            continue;
+        }
+        match cached_catalog(alias, registration) {
+            Ok(catalog) => {
+                result.statuses.insert(
+                    alias.clone(),
+                    CatalogStatus {
+                        alias: alias.clone(),
+                        availability: CatalogAvailability::Stale,
+                        warning: None,
+                        catalog: Some(catalog),
+                    },
+                );
+            }
+            Err(_) => {
+                result.statuses.insert(
+                    alias.clone(),
+                    CatalogStatus {
+                        alias: alias.clone(),
+                        availability: CatalogAvailability::Unavailable,
+                        warning: Some("no synchronized catalog cache".to_owned()),
+                        catalog: None,
+                    },
+                );
+            }
+        }
+    }
+    Ok(result)
+}
+
 pub fn sync_registered_catalogs_resilient(config: &GlobalConfig) -> Result<CatalogSync> {
     let mut result = CatalogSync::default();
     for (alias, registration) in &config.catalogs {
