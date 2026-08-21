@@ -1,3 +1,10 @@
+## [0.6.1] - 2026-08-21
+
+### Fixed
+
+- Replace complete folded YAML description blocks when adding projected scope labels.
+- Retry only skills omitted by a successful Vercel batch placement, then require complete selected-agent verification.
+
 ## [0.6.0] - 2026-08-21
 
 ### Features

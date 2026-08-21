@@ -215,6 +215,13 @@ pub(crate) fn install_with_catalogs_recovery(
         )?;
         journal.phase = TransactionPhase::I;
         write_json_atomic_compact(&paths.transaction_path, &journal)?;
+        retry_missing_installations(
+            &paths.command_root,
+            &prepared_root,
+            scope.is_global(),
+            &resolved,
+            &manifest.agents,
+        )?;
         verify_installation(
             &paths.command_root,
             scope.is_global(),
@@ -667,6 +674,38 @@ fn refuse_unowned_conflicts(
                 skill.installed_name
             );
         }
+    }
+    Ok(())
+}
+
+fn retry_missing_installations(
+    command_root: &Path,
+    prepared_root: &Path,
+    global_scope: bool,
+    resolved: &[ResolvedSkill<'_>],
+    agents: &[String],
+) -> Result<()> {
+    let mut missing = BTreeSet::new();
+    for agent in agents {
+        let installed = list_agent_skill_names(command_root, global_scope, agent)?;
+        for skill in resolved {
+            if !installed.contains(&skill.installed_name) {
+                missing.insert(skill.installed_name.as_str());
+            }
+        }
+    }
+    for name in missing {
+        let skill = resolved
+            .iter()
+            .find(|skill| skill.installed_name == name)
+            .context("missing installation has no resolved skill")?;
+        run_vercel_install(
+            command_root,
+            prepared_root,
+            std::slice::from_ref(skill),
+            agents,
+            global_scope,
+        )?;
     }
     Ok(())
 }

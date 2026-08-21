@@ -82,19 +82,29 @@ fn set_frontmatter_field(raw: &str, key: &str, value: Option<&str>) -> Result<St
         bail!("SKILL.md contains duplicate {key} fields");
     }
     let mut output = Vec::with_capacity(lines.len() + 1);
-    for (index, line) in lines.iter().enumerate() {
+    let mut index = 0usize;
+    while index < lines.len() {
+        let line = lines[index];
         if matches.first() == Some(&index) {
             if let Some(value) = value {
                 output.push(format!("{key}: {value}"));
             }
-        } else if index == closing && matches.is_empty() {
-            if let Some(value) = value {
-                output.push(format!("{key}: {value}"));
+            index += 1;
+            while index < closing
+                && (lines[index].is_empty() || lines[index].starts_with(char::is_whitespace))
+            {
+                index += 1;
             }
-            output.push((*line).to_owned());
-        } else {
-            output.push((*line).to_owned());
+            continue;
         }
+        if index == closing
+            && matches.is_empty()
+            && let Some(value) = value
+        {
+            output.push(format!("{key}: {value}"));
+        }
+        output.push(line.to_owned());
+        index += 1;
     }
     Ok(format!("{}\n", output.join("\n")))
 }
@@ -187,7 +197,7 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(
             base.join("SKILL.md"),
-            "---\nname: commit\ndescription: Create safe commits\n---\n",
+            "---\nname: commit\ndescription: >-\n  Create safe commits\n  without losing state.\n---\n",
         )
         .unwrap();
         apply_projected_identity(&base, "commit", Some("engineering"), "Create safe commits")
@@ -195,6 +205,7 @@ mod tests {
         let raw = std::fs::read_to_string(base.join("SKILL.md")).unwrap();
         assert!(raw.contains("name: commit\n"));
         assert!(raw.contains("description: \"[engineering] Create safe commits\""));
+        assert!(!raw.contains("without losing state"));
         std::fs::remove_dir_all(&base).unwrap();
     }
 
