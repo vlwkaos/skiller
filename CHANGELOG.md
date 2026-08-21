@@ -1,3 +1,9 @@
+## [0.7.1] - 2026-08-21
+
+### Fixed
+
+- Ignore empty runtime-created directories when comparing authoring and canonical skill content.
+
 ## [0.7.0] - 2026-08-21
 
 ### Features

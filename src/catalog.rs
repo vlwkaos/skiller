@@ -550,17 +550,15 @@ fn directory_digest(root: &Path) -> Result<String> {
             if metadata.file_type().is_symlink() {
                 bail!("skill source contains a symlink: {}", path.display());
             }
-            let relative = path.strip_prefix(root).expect("walked path is below root");
-            update(hash, relative.to_string_lossy().as_bytes());
-            update(hash, &[0]);
             if metadata.is_dir() {
-                update(hash, b"d");
                 walk(root, &path, hash)?;
             } else if metadata.is_file() {
-                update(hash, b"f");
+                let relative = path.strip_prefix(root).expect("walked path is below root");
+                update(hash, relative.to_string_lossy().as_bytes());
+                update(hash, &[0]);
                 update(hash, &std::fs::read(&path)?);
+                update(hash, &[0xff]);
             }
-            update(hash, &[0xff]);
         }
         Ok(())
     }
@@ -741,6 +739,24 @@ mod tests {
                 "git@github.com:vlwkaos/skills.git"
             ]
         );
+    }
+
+    #[test]
+    fn skill_digest_ignores_empty_runtime_directories() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/catalog-empty-directory-digest");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            "---\nname: test\ndescription: Test\n---\n",
+        )
+        .unwrap();
+        let before = directory_digest(&root).unwrap();
+        std::fs::create_dir_all(root.join(".claude/.cc-writes")).unwrap();
+        assert_eq!(directory_digest(&root).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
