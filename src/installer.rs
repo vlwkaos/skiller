@@ -5,7 +5,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{CatalogIndex, load_global_config, sync_registered_catalogs};
+use crate::catalog::{CatalogIndex, load_global_config, sync_registered_catalogs_resilient};
 use crate::manual::{apply_invocation_mode, apply_projected_identity};
 use crate::model::{
     EffectiveMode, INSTALLED_STATE_VERSION, InstalledSkill, InstalledState, ProjectConfig,
@@ -73,7 +73,20 @@ pub(crate) struct TransactionJournal {
 
 pub fn install(scope: InstallScope) -> Result<()> {
     let global_config = load_global_config()?;
-    let catalogs = sync_registered_catalogs(&global_config)?;
+    let sync = sync_registered_catalogs_resilient(&global_config)?;
+    for status in sync
+        .statuses
+        .values()
+        .filter(|status| status.warning.is_some())
+    {
+        eprintln!(
+            "warning: catalog {} is unavailable: {}",
+            status.alias,
+            status.warning.as_deref().unwrap_or_default()
+        );
+    }
+    let unavailable_aliases = sync.unavailable_aliases();
+    let catalogs = sync.catalogs;
     let manifest = match &scope {
         InstallScope::Project(project_root) => {
             let path = project_root.join("skiller.config.json");
@@ -85,13 +98,14 @@ pub fn install(scope: InstallScope) -> Result<()> {
             agents: global_config.agents,
         },
     };
-    install_with_catalogs(scope, &manifest, &catalogs)
+    install_with_catalogs_preserving(scope, &manifest, &catalogs, &unavailable_aliases)
 }
 
-pub fn install_with_catalogs(
+pub(crate) fn install_with_catalogs_preserving(
     scope: InstallScope,
     manifest: &ProjectConfig,
     catalogs: &BTreeMap<String, CatalogIndex>,
+    unavailable_aliases: &BTreeSet<String>,
 ) -> Result<()> {
     install_with_catalogs_recovery(
         scope,
@@ -100,6 +114,7 @@ pub fn install_with_catalogs(
         &BTreeSet::new(),
         &BTreeSet::new(),
         false,
+        unavailable_aliases,
     )
 }
 
@@ -116,6 +131,7 @@ pub(crate) fn install_migration(
         legacy_names,
         &BTreeSet::new(),
         false,
+        &BTreeSet::new(),
     )
 }
 
@@ -126,6 +142,7 @@ pub(crate) fn install_with_catalogs_recovery(
     replacement_owned: &BTreeSet<String>,
     cleanup_owned: &BTreeSet<String>,
     recovering: bool,
+    unavailable_aliases: &BTreeSet<String>,
 ) -> Result<()> {
     validate_schema(manifest.version, "skill config")?;
     validate_agents(&manifest.agents)?;
@@ -142,7 +159,27 @@ pub(crate) fn install_with_catalogs_recovery(
     let previous: InstalledState = read_json_or_default(&paths.state_path)?;
     validate_installed_state(previous.version)?;
     validate_owned_state(&previous, paths.state_prefix)?;
-    let resolved = resolve_manifest(manifest, catalogs, scope.is_global())?;
+    let active_manifest = manifest_without_unavailable(manifest, unavailable_aliases);
+    let resolved = resolve_manifest(&active_manifest, catalogs, scope.is_global())?;
+    let preserved: BTreeMap<_, _> = previous
+        .skills
+        .iter()
+        .filter(|(key, _)| key_alias(key).is_some_and(|alias| unavailable_aliases.contains(alias)))
+        .map(|(key, skill)| (key.clone(), skill.clone()))
+        .collect();
+    let reserved_names: BTreeSet<_> = preserved
+        .values()
+        .map(|skill| skill.installed_name.as_str())
+        .collect();
+    if let Some(skill) = resolved
+        .iter()
+        .find(|skill| reserved_names.contains(skill.installed_name.as_str()))
+    {
+        bail!(
+            "installed skill name collision: unavailable catalog owns {}",
+            skill.installed_name
+        );
+    }
 
     ensure_real_dir(
         paths
@@ -186,12 +223,15 @@ pub(crate) fn install_with_catalogs_recovery(
         let desired_names: BTreeSet<_> = resolved
             .iter()
             .map(|skill| skill.installed_name.clone())
+            .chain(preserved.values().map(|skill| skill.installed_name.clone()))
             .collect();
         let mut removed: BTreeSet<_> = previous
             .skills
-            .values()
-            .filter(|skill| !desired_names.contains(&skill.installed_name))
-            .map(|skill| skill.installed_name.clone())
+            .iter()
+            .filter(|(key, skill)| {
+                !preserved.contains_key(*key) && !desired_names.contains(&skill.installed_name)
+            })
+            .map(|(_, skill)| skill.installed_name.clone())
             .collect();
         removed.extend(
             cleanup_owned
@@ -203,7 +243,7 @@ pub(crate) fn install_with_catalogs_recovery(
             v: 1,
             scope: if scope.is_global() { "g" } else { "p" }.to_owned(),
             phase: TransactionPhase::P,
-            config: manifest_fingerprint(manifest)?,
+            config: manifest_fingerprint(&active_manifest)?,
             desired: desired_names.iter().cloned().collect(),
             remove: removed.iter().cloned().collect(),
         };
@@ -251,23 +291,22 @@ pub(crate) fn install_with_catalogs_recovery(
         journal.phase = TransactionPhase::C;
         write_json_atomic_compact(&paths.transaction_path, &journal)?;
 
+        let mut next_skills = preserved;
+        next_skills.extend(resolved.iter().map(|skill| {
+            (
+                skill.key.clone(),
+                InstalledSkill {
+                    installed_name: skill.installed_name.clone(),
+                    mode: skill.mode,
+                    gitignore: skill.gitignore,
+                    digest: Some(skill.digest.clone()),
+                    legacy_path: None,
+                },
+            )
+        }));
         let next = InstalledState {
             version: INSTALLED_STATE_VERSION,
-            skills: resolved
-                .iter()
-                .map(|skill| {
-                    (
-                        skill.key.clone(),
-                        InstalledSkill {
-                            installed_name: skill.installed_name.clone(),
-                            mode: skill.mode,
-                            gitignore: skill.gitignore,
-                            digest: Some(skill.digest.clone()),
-                            legacy_path: None,
-                        },
-                    )
-                })
-                .collect(),
+            skills: next_skills,
         };
         write_json_atomic_compact(&paths.state_path, &next)?;
         if let InstallScope::Project(project_root) = &scope {
@@ -340,6 +379,21 @@ pub(crate) fn install_paths(scope: &InstallScope) -> Result<InstallPaths> {
             })
         }
     }
+}
+
+fn manifest_without_unavailable(
+    manifest: &ProjectConfig,
+    unavailable_aliases: &BTreeSet<String>,
+) -> ProjectConfig {
+    let mut active = manifest.clone();
+    active
+        .skills
+        .retain(|key, _| key_alias(key).is_none_or(|alias| !unavailable_aliases.contains(alias)));
+    active
+}
+
+fn key_alias(key: &str) -> Option<&str> {
+    key.split_once('/').map(|(alias, _)| alias)
 }
 
 pub(crate) fn resolve_manifest<'a>(
@@ -963,6 +1017,29 @@ mod tests {
         let resolved = resolve_manifest(&manifest, &catalogs, true).unwrap();
         assert_eq!(resolved[0].mode, EffectiveMode::Enable);
         assert_eq!(resolved[1].mode, EffectiveMode::Manual);
+    }
+
+    #[test]
+    fn unavailable_catalog_filter_keeps_declarations_out_of_reconciliation() {
+        let manifest = ProjectConfig {
+            version: SCHEMA_VERSION,
+            skills: BTreeMap::from([
+                (
+                    "offline/root".to_owned(),
+                    SkillSelection::Mode(SelectionMode::Enable),
+                ),
+                (
+                    "pyg/root".to_owned(),
+                    SkillSelection::Mode(SelectionMode::Enable),
+                ),
+            ]),
+            agents: crate::model::default_agents(),
+        };
+        let unavailable = BTreeSet::from(["offline".to_owned()]);
+        let active = manifest_without_unavailable(&manifest, &unavailable);
+        assert!(manifest.skills.contains_key("offline/root"));
+        assert!(!active.skills.contains_key("offline/root"));
+        assert!(active.skills.contains_key("pyg/root"));
     }
 
     #[test]

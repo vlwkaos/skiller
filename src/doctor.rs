@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use crate::catalog::{CatalogIndex, load_global_config, resolve_rename, sync_registered_catalogs};
+use crate::catalog::{
+    CatalogAvailability, CatalogIndex, CatalogStatus, load_global_config, resolve_rename,
+    sync_registered_catalogs_resilient,
+};
 use crate::installer::{
     InstallScope, TransactionJournal, TransactionPhase, install_paths,
     install_with_catalogs_recovery, list_agent_skill_names, manifest_fingerprint, projection_roots,
@@ -34,6 +37,19 @@ struct DoctorReport<'a> {
     scope: &'a str,
     healthy: bool,
     issues: &'a [DoctorIssue],
+    catalog_status: &'a [DoctorCatalogStatus],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DoctorCatalogStatus {
+    alias: String,
+    availability: &'static str,
+    stale: bool,
+    declared_count: usize,
+    installed_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 struct Inputs {
@@ -41,6 +57,9 @@ struct Inputs {
     global_config: crate::model::GlobalConfig,
     manifest: ProjectConfig,
     catalogs: BTreeMap<String, CatalogIndex>,
+    statuses: BTreeMap<String, CatalogStatus>,
+    unavailable_aliases: BTreeSet<String>,
+    declared_counts: BTreeMap<String, usize>,
 }
 
 // ^ README.md#doctor-and-recovery defines the read-only and explicit-repair boundary.
@@ -58,7 +77,7 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
                 message: format!("{error:#}"),
                 fixable: false,
             }];
-            print_report(scope_name, &issues, print)?;
+            print_report(scope_name, &issues, &[], print)?;
             if repair {
                 bail!("Doctor cannot repair invalid configuration or catalog data");
             }
@@ -233,6 +252,12 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
             .map(|skill| skill.installed_name.as_str())
             .collect();
         for (key, installed) in &state.skills {
+            if key
+                .split_once('/')
+                .is_some_and(|(alias, _)| inputs.unavailable_aliases.contains(alias))
+            {
+                continue;
+            }
             match desired_by_key.get(key.as_str()) {
                 None => issues.push(DoctorIssue {
                     code: "obsolete-owned-skill",
@@ -334,7 +359,8 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
     }
 
     deduplicate_issues(&mut issues);
-    print_report(scope_name, &issues, print)?;
+    let catalog_status = doctor_catalog_statuses(&inputs, &state);
+    print_report(scope_name, &issues, &catalog_status, print)?;
     if !repair || issues.is_empty() {
         return Ok(());
     }
@@ -347,7 +373,7 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
         return Ok(());
     }
 
-    if migrated != inputs.manifest {
+    if migrated != inputs.manifest && inputs.unavailable_aliases.is_empty() {
         save_manifest(
             &scope,
             &inputs.config_path,
@@ -367,6 +393,7 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
         &recovery_owned,
         &recovery_owned,
         journal.is_some(),
+        &inputs.unavailable_aliases,
     )?;
     println!("Doctor repaired {scope_name} Skiller state");
     Ok(())
@@ -377,8 +404,10 @@ fn load_inputs(scope: &InstallScope) -> Result<Inputs> {
     if global_config.catalogs.is_empty() {
         bail!("no catalogs configured; run `skiller add-catalog <alias> <source>`");
     }
-    let catalogs = sync_registered_catalogs(&global_config)?;
-    let (config_path, manifest) = match scope {
+    let sync = sync_registered_catalogs_resilient(&global_config)?;
+    let unavailable_aliases = sync.unavailable_aliases();
+    let catalogs = sync.catalogs;
+    let (config_path, mut manifest) = match scope {
         InstallScope::Project(project_root) => {
             let path = project_root.join("skiller.config.json");
             let manifest = read_json(&path).with_context(|| "run `skiller config` first")?;
@@ -394,11 +423,32 @@ fn load_inputs(scope: &InstallScope) -> Result<Inputs> {
         ),
     };
     validate_schema(manifest.version, "skill config")?;
+    let declared_counts = global_config
+        .catalogs
+        .keys()
+        .map(|alias| {
+            (
+                alias.clone(),
+                manifest
+                    .skills
+                    .keys()
+                    .filter(|key| key.starts_with(&format!("{alias}/")))
+                    .count(),
+            )
+        })
+        .collect();
+    manifest.skills.retain(|key, _| {
+        key.split_once('/')
+            .is_none_or(|(alias, _)| !unavailable_aliases.contains(alias))
+    });
     Ok(Inputs {
         config_path,
         global_config,
         manifest,
         catalogs,
+        statuses: sync.statuses,
+        unavailable_aliases,
+        declared_counts,
     })
 }
 
@@ -603,7 +653,39 @@ fn deduplicate_issues(issues: &mut Vec<DoctorIssue>) {
     issues.retain(|issue| seen.insert((issue.code, issue.message.clone())));
 }
 
-fn print_report(scope: &str, issues: &[DoctorIssue], print: bool) -> Result<()> {
+fn doctor_catalog_statuses(inputs: &Inputs, state: &InstalledState) -> Vec<DoctorCatalogStatus> {
+    inputs
+        .statuses
+        .values()
+        .map(|status| DoctorCatalogStatus {
+            alias: status.alias.clone(),
+            availability: match status.availability {
+                CatalogAvailability::Available => "available",
+                CatalogAvailability::Stale => "stale",
+                CatalogAvailability::Unavailable => "unavailable",
+            },
+            stale: status.availability == CatalogAvailability::Stale,
+            declared_count: inputs
+                .declared_counts
+                .get(&status.alias)
+                .copied()
+                .unwrap_or_default(),
+            installed_count: state
+                .skills
+                .keys()
+                .filter(|key| key.starts_with(&format!("{}/", status.alias)))
+                .count(),
+            warning: status.warning.clone(),
+        })
+        .collect()
+}
+
+fn print_report(
+    scope: &str,
+    issues: &[DoctorIssue],
+    catalog_status: &[DoctorCatalogStatus],
+    print: bool,
+) -> Result<()> {
     if print {
         println!(
             "{}",
@@ -611,6 +693,7 @@ fn print_report(scope: &str, issues: &[DoctorIssue], print: bool) -> Result<()> 
                 scope,
                 healthy: issues.is_empty(),
                 issues,
+                catalog_status,
             })?
         );
     } else if issues.is_empty() {
@@ -684,6 +767,46 @@ mod tests {
                 },
             )]),
         }
+    }
+
+    #[test]
+    fn doctor_status_reports_unavailable_catalog_without_configuration_failure() {
+        let inputs = Inputs {
+            config_path: PathBuf::from("test"),
+            global_config: crate::model::GlobalConfig::default(),
+            manifest: ProjectConfig::default(),
+            catalogs: BTreeMap::new(),
+            statuses: BTreeMap::from([(
+                "offline".to_owned(),
+                CatalogStatus {
+                    alias: "offline".to_owned(),
+                    availability: CatalogAvailability::Unavailable,
+                    warning: Some("network unavailable".to_owned()),
+                    catalog: None,
+                },
+            )]),
+            unavailable_aliases: BTreeSet::from(["offline".to_owned()]),
+            declared_counts: BTreeMap::from([("offline".to_owned(), 1)]),
+        };
+        let state = InstalledState {
+            version: INSTALLED_STATE_VERSION,
+            skills: BTreeMap::from([(
+                "offline/root".to_owned(),
+                crate::model::InstalledSkill {
+                    installed_name: "root".to_owned(),
+                    mode: crate::model::EffectiveMode::Enable,
+                    gitignore: false,
+                    digest: None,
+                    legacy_path: None,
+                },
+            )]),
+        };
+        let report = doctor_catalog_statuses(&inputs, &state);
+        assert_eq!(report[0].availability, "unavailable");
+        assert_eq!(
+            (report[0].declared_count, report[0].installed_count),
+            (1, 1)
+        );
     }
 
     #[test]

@@ -1,3 +1,14 @@
+## [0.8.0] - 2026-08-21
+
+### Features
+
+- Continue noninteractive reconciliation when a registered catalog source is unreachable, while preserving its declarations, owned installations, and projections.
+- Add stable camelCase catalog availability status to config, update, and Doctor JSON reports, including read-only stale cache rows.
+
+### Fixed
+
+- Validate refreshed catalog clones before replacing the last known-good cache and keep authoring-checkout failures diagnostic-only.
+
 ## [0.7.3] - 2026-08-21
 
 ### Security

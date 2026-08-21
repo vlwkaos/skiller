@@ -35,6 +35,39 @@ pub struct CatalogSkill {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogAvailability {
+    Available,
+    Stale,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogStatus {
+    pub alias: String,
+    pub availability: CatalogAvailability,
+    pub warning: Option<String>,
+    /// A stale index is intentionally exposed only to read-only callers.
+    pub catalog: Option<CatalogIndex>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CatalogSync {
+    /// Fresh, canonical catalogs which may participate in reconciliation.
+    pub catalogs: BTreeMap<String, CatalogIndex>,
+    pub statuses: BTreeMap<String, CatalogStatus>,
+}
+
+impl CatalogSync {
+    pub fn unavailable_aliases(&self) -> std::collections::BTreeSet<String> {
+        self.statuses
+            .iter()
+            .filter(|(_, status)| status.availability != CatalogAvailability::Available)
+            .map(|(alias, _)| alias.clone())
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogEligibility {
     Global,
     Project,
@@ -261,58 +294,161 @@ pub fn sync_registered_catalogs(config: &GlobalConfig) -> Result<BTreeMap<String
 }
 
 pub fn sync_catalog(alias: &str, registration: &CatalogRegistration) -> Result<CatalogIndex> {
-    sync_catalog_with_policy(alias, registration, false)
+    sync_catalog_with_policy(alias, registration, false).map_err(|error| match error {
+        SyncError::Unreachable(error) | SyncError::Invalid(error) => error,
+    })
 }
 
-pub fn sync_registered_catalogs_noninteractive(
-    config: &GlobalConfig,
-) -> Result<BTreeMap<String, CatalogIndex>> {
-    config
-        .catalogs
-        .iter()
-        .map(|(alias, registration)| {
-            sync_catalog_with_policy(alias, registration, true)
-                .map(|catalog| (alias.clone(), catalog))
-        })
-        .collect()
+/// Refresh every registration without prompting. Only source acquisition errors are
+/// downgraded: a reached catalog which fails validation remains an error.
+pub fn sync_registered_catalogs_resilient(config: &GlobalConfig) -> Result<CatalogSync> {
+    let mut result = CatalogSync::default();
+    for (alias, registration) in &config.catalogs {
+        match sync_catalog_with_policy(alias, registration, true) {
+            Ok(catalog) => {
+                result.catalogs.insert(alias.clone(), catalog.clone());
+                result.statuses.insert(
+                    alias.clone(),
+                    CatalogStatus {
+                        alias: alias.clone(),
+                        availability: CatalogAvailability::Available,
+                        warning: None,
+                        catalog: Some(catalog),
+                    },
+                );
+            }
+            Err(SyncError::Invalid(error)) => return Err(error),
+            Err(SyncError::Unreachable(error)) => {
+                let stale = cached_catalog(alias, registration).ok();
+                result.statuses.insert(
+                    alias.clone(),
+                    CatalogStatus {
+                        alias: alias.clone(),
+                        availability: if stale.is_some() {
+                            CatalogAvailability::Stale
+                        } else {
+                            CatalogAvailability::Unavailable
+                        },
+                        warning: Some(sanitized_warning(&error)),
+                        catalog: stale,
+                    },
+                );
+            }
+        }
+    }
+    Ok(result)
 }
 
-pub fn sync_registered_authoring_catalogs(
+fn cached_catalog(alias: &str, registration: &CatalogRegistration) -> Result<CatalogIndex> {
+    scan_catalog(
+        alias,
+        &registration.source,
+        &cache_root()?.join("catalogs").join(alias),
+    )
+}
+
+fn sanitized_warning(error: &anyhow::Error) -> String {
+    // Do not echo a registered URL or local path (which can contain credentials).
+    let error_message = error.to_string();
+    let detail = error_message
+        .rsplit_once(": ")
+        .map(|(_, detail)| detail)
+        .unwrap_or("source unavailable");
+    let mut value: String = detail
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    value.truncate(240);
+    if value.is_empty() {
+        "source unavailable".to_owned()
+    } else {
+        value
+    }
+}
+
+/// A writable draft is supplementary to its canonical catalog. Its failure must not
+/// turn a successful published update check into a failure.
+pub fn sync_registered_authoring_catalogs_resilient(
     config: &GlobalConfig,
     canonical: &BTreeMap<String, CatalogIndex>,
-) -> Result<BTreeMap<String, CatalogIndex>> {
+) -> (BTreeMap<String, CatalogIndex>, BTreeMap<String, String>) {
     let mut catalogs = canonical.clone();
+    let mut warnings = BTreeMap::new();
     for (alias, registration) in &config.catalogs {
         let Some(root) = &registration.authoring_root else {
             continue;
         };
-        let root = validate_authoring_root(alias, Path::new(root))?;
-        catalogs.insert(
-            alias.clone(),
-            scan_catalog(alias, &registration.source, &root)?,
-        );
+        if !canonical.contains_key(alias) {
+            continue;
+        }
+        match validate_authoring_root(alias, Path::new(root))
+            .and_then(|root| scan_catalog(alias, &registration.source, &root))
+        {
+            Ok(catalog) => {
+                catalogs.insert(alias.clone(), catalog);
+            }
+            Err(error) => {
+                warnings.insert(alias.clone(), sanitized_warning(&error));
+            }
+        }
     }
-    Ok(catalogs)
+    (catalogs, warnings)
+}
+
+enum SyncError {
+    Unreachable(anyhow::Error),
+    Invalid(anyhow::Error),
 }
 
 fn sync_catalog_with_policy(
     alias: &str,
     registration: &CatalogRegistration,
     noninteractive: bool,
-) -> Result<CatalogIndex> {
-    validate_alias(alias)?;
+) -> std::result::Result<CatalogIndex, SyncError> {
+    validate_alias(alias).map_err(SyncError::Invalid)?;
     if registration.r#ref.as_deref().is_some_and(str::is_empty) {
-        bail!("catalog {alias} ref cannot be empty");
+        return Err(SyncError::Invalid(anyhow::anyhow!(
+            "catalog {alias} ref cannot be empty"
+        )));
     }
     let source_path = PathBuf::from(&registration.source);
-    let root = if source_path.exists() && registration.r#ref.is_none() {
-        source_path
-            .canonicalize()
-            .with_context(|| format!("resolving catalog source {}", registration.source))?
+    let (root, refreshed) = if source_path.exists() && registration.r#ref.is_none() {
+        (
+            source_path.canonicalize().map_err(|error| {
+                SyncError::Unreachable(
+                    anyhow::Error::new(error)
+                        .context(format!("resolving catalog source {}", registration.source)),
+                )
+            })?,
+            false,
+        )
     } else {
-        clone_catalog(alias, registration, noninteractive)?
+        (
+            clone_catalog(alias, registration, noninteractive).map_err(SyncError::Unreachable)?,
+            true,
+        )
     };
-    scan_catalog(alias, &registration.source, &root)
+    // Validate the new clone before it replaces the last known-good cache.
+    if let Err(error) = scan_catalog(alias, &registration.source, &root) {
+        if refreshed && let Ok(catalogs_root) = cache_root().map(|root| root.join("catalogs")) {
+            let _ = safe_remove_owned_dir(&root, &catalogs_root);
+        }
+        return Err(SyncError::Invalid(error));
+    }
+    if refreshed {
+        let catalogs_root = cache_root()
+            .map_err(SyncError::Unreachable)?
+            .join("catalogs");
+        let destination = catalogs_root.join(alias);
+        safe_remove_owned_dir(&destination, &catalogs_root).map_err(SyncError::Unreachable)?;
+        std::fs::rename(&root, &destination).map_err(|error| {
+            SyncError::Unreachable(
+                anyhow::Error::new(error).context(format!("committing refreshed catalog {alias}")),
+            )
+        })?;
+        return scan_catalog(alias, &registration.source, &destination).map_err(SyncError::Invalid);
+    }
+    scan_catalog(alias, &registration.source, &root).map_err(SyncError::Invalid)
 }
 
 fn clone_catalog(
@@ -322,8 +458,9 @@ fn clone_catalog(
 ) -> Result<PathBuf> {
     let catalogs_root = cache_root()?.join("catalogs");
     crate::paths::ensure_real_dir(&catalogs_root)?;
-    let destination = catalogs_root.join(alias);
-    safe_remove_owned_dir(&destination, &catalogs_root)?;
+    // Preserve the last good clone until this refresh has succeeded.
+    let staging = catalogs_root.join(format!(".{alias}-refresh-{}", std::process::id()));
+    safe_remove_owned_dir(&staging, &catalogs_root)?;
 
     let candidates = clone_candidates(&registration.source);
     let mut failures = Vec::new();
@@ -346,7 +483,7 @@ fn clone_catalog(
         }
         let output = command
             .arg(&candidate)
-            .arg(&destination)
+            .arg(&staging)
             .output()
             .with_context(|| format!("starting git clone for {}", registration.source))?;
         if output.status.success() {
@@ -355,7 +492,7 @@ fn clone_catalog(
                 let mut fetch = Command::new("git");
                 fetch
                     .args(["fetch", "--depth", "1", "origin", reference])
-                    .current_dir(&destination);
+                    .current_dir(&staging);
                 if noninteractive {
                     fetch.env("GIT_TERMINAL_PROMPT", "0").env(
                         "GIT_SSH_COMMAND",
@@ -366,22 +503,22 @@ fn clone_catalog(
                 let checked_out = fetched.status.success()
                     && Command::new("git")
                         .args(["checkout", "--detach", "FETCH_HEAD"])
-                        .current_dir(&destination)
+                        .current_dir(&staging)
                         .output()?
                         .status
                         .success();
                 if !checked_out {
                     failures.push(sanitize_child_output(&fetched.stderr));
-                    safe_remove_owned_dir(&destination, &catalogs_root)?;
+                    safe_remove_owned_dir(&staging, &catalogs_root)?;
                     continue;
                 }
             }
-            return destination
+            return staging
                 .canonicalize()
                 .with_context(|| format!("resolving cloned catalog {alias}"));
         }
         failures.push(sanitize_child_output(&output.stderr));
-        safe_remove_owned_dir(&destination, &catalogs_root)?;
+        safe_remove_owned_dir(&staging, &catalogs_root)?;
     }
     bail!(
         "failed to clone catalog {}: {}",
@@ -720,6 +857,31 @@ fn validate_dependencies(skills: &BTreeMap<String, CatalogSkill>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reachable_malformed_catalog_remains_a_hard_error() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/malformed-catalog");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("skills/broken")).unwrap();
+        std::fs::write(root.join("skills/broken/SKILL.md"), "not frontmatter").unwrap();
+        let config = GlobalConfig {
+            version: crate::model::SCHEMA_VERSION,
+            catalogs: BTreeMap::from([(
+                "bad".to_owned(),
+                CatalogRegistration {
+                    source: root.display().to_string(),
+                    r#ref: None,
+                    authoring_root: None,
+                },
+            )]),
+            skills: BTreeMap::new(),
+            agents: crate::model::default_agents(),
+        };
+        assert!(sync_registered_catalogs_resilient(&config).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn scope_does_not_change_the_installed_name() {

@@ -58,12 +58,13 @@ pub(crate) fn run(
             KeyCode::PageDown => selected = (selected + 10).min(rows.len().saturating_sub(1)),
             KeyCode::Home => selected = 0,
             KeyCode::End => selected = rows.len().saturating_sub(1),
-            KeyCode::Char(' ') if !rows.is_empty() => {
+            KeyCode::Char(' ') if !rows.is_empty() && !rows[selected].read_only => {
                 cycle_selection(manifest, &rows[selected].key)
             }
             KeyCode::Char('i')
                 if !global_scope
                     && !rows.is_empty()
+                    && !rows[selected].read_only
                     && manifest.skills.contains_key(&rows[selected].key) =>
             {
                 toggle_gitignore(manifest, &rows[selected].key);
@@ -162,11 +163,16 @@ pub(crate) fn view_lines(
         };
         lines.push(fit(
             &format!(
-                "{} {mark} ${}:{} → {} · {installed}{ignored}",
+                "{} {mark} ${}:{} → {} · {installed}{ignored}{}",
                 if absolute == selected { '›' } else { ' ' },
                 row.scope,
                 row.name,
                 row.installed_name,
+                if row.read_only {
+                    " · stale/read-only"
+                } else {
+                    ""
+                },
             ),
             width,
         ));
@@ -243,6 +249,8 @@ mod tests {
             installed,
             installed_mode: installed.then_some(EffectiveMode::Enable),
             required_by: Vec::new(),
+            read_only: false,
+            status: None,
         }
     }
 

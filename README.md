@@ -78,7 +78,7 @@ Dependencies use comma-separated `metadata.skiller.requires`. Missing dependenci
 - Noninteractive mutation requires `--yes`.
 - Skiller removes only prior ownership or exact validated migration/recovery names.
 - Installed state is compact schema 3 under the XDG state directory and records deterministic projected-content digests.
-- Catalog checks may refresh caches but never install; updates remain confirmation-gated.
+- Catalog checks may refresh caches but never install; updates remain confirmation-gated. Unreachable sources are warned once and skipped for that reconciliation; a readable prior cache is shown as read-only stale metadata. `config --print`, `update --check --json`, and `doctor --print` expose a camelCase `catalogStatus` array with alias, availability/stale state, declared and installed counts, and a sanitized warning.
 - Interrupted installation retains an owned transaction journal for Doctor recovery.
 
 The guided migration procedure is also available as `skills/skiller-migrate/SKILL.md` in this repository.

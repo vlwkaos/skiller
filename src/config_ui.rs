@@ -5,8 +5,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::catalog::{CatalogIndex, load_global_config, sync_registered_catalogs};
-use crate::installer::{InstallScope, install_with_catalogs};
+use crate::catalog::{
+    CatalogAvailability, CatalogIndex, CatalogStatus, load_global_config,
+    sync_registered_catalogs_resilient,
+};
+use crate::installer::InstallScope;
 use crate::model::{
     EffectiveMode, InstalledState, ProjectConfig, SelectionMode, SkillSelection,
     validate_installed_state, validate_schema,
@@ -32,6 +35,8 @@ pub(crate) struct ConfigRow {
     pub(crate) installed: bool,
     pub(crate) installed_mode: Option<EffectiveMode>,
     pub(crate) required_by: Vec<String>,
+    pub(crate) read_only: bool,
+    pub(crate) status: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -41,6 +46,19 @@ struct PrintedConfig<'a> {
     config_path: String,
     agents: &'a [String],
     skills: &'a [ConfigRow],
+    catalog_status: Vec<PrintedCatalogStatus>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrintedCatalogStatus {
+    alias: String,
+    availability: &'static str,
+    stale: bool,
+    declared_count: usize,
+    installed_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 pub fn configure(
@@ -54,7 +72,8 @@ pub fn configure(
     if global_config.catalogs.is_empty() {
         anyhow::bail!("no catalogs configured; run `skiller add-catalog <alias> <source>`");
     }
-    let catalogs = sync_registered_catalogs(&global_config)?;
+    let sync = sync_registered_catalogs_resilient(&global_config)?;
+    let catalogs = sync.catalogs.clone();
     let (config_path, state_path, mut manifest) = match &scope {
         InstallScope::Project(project_root) => {
             let config_path = project_root.join("skiller.config.json");
@@ -78,7 +97,27 @@ pub fn configure(
     validate_schema(manifest.version, "skill config")?;
     let state: InstalledState = read_json_or_default(&state_path)?;
     validate_installed_state(state.version)?;
-    let rows = config_rows(&catalogs, &state, &manifest, scope.is_global());
+    let stale_aliases: BTreeSet<_> = sync
+        .statuses
+        .iter()
+        .filter(|(_, status)| status.availability == CatalogAvailability::Stale)
+        .map(|(alias, _)| alias.clone())
+        .collect();
+    let mut display_catalogs = catalogs.clone();
+    for (alias, status) in &sync.statuses {
+        if let Some(catalog) = &status.catalog
+            && status.availability == CatalogAvailability::Stale
+        {
+            display_catalogs.insert(alias.clone(), catalog.clone());
+        }
+    }
+    let rows = config_rows(
+        &display_catalogs,
+        &state,
+        &manifest,
+        scope.is_global(),
+        &stale_aliases,
+    );
 
     if print_only {
         let output = PrintedConfig {
@@ -90,6 +129,7 @@ pub fn configure(
             config_path: config_path.display().to_string(),
             agents: &manifest.agents,
             skills: &rows,
+            catalog_status: printed_catalog_statuses(&sync.statuses, &manifest, &state),
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
@@ -116,7 +156,7 @@ pub fn configure(
         crate::config_tui::ConfigTuiResult::Save => {
             save_manifest(&scope, &config_path, &manifest, &mut global_config)?;
             println!("saved {}", config_path.display());
-            maybe_install(scope, &manifest, &catalogs)
+            maybe_install(scope, &manifest, &catalogs, &sync.unavailable_aliases())
         }
     }
 }
@@ -146,6 +186,7 @@ fn config_rows(
     state: &InstalledState,
     manifest: &ProjectConfig,
     global_scope: bool,
+    stale_aliases: &BTreeSet<String>,
 ) -> Vec<ConfigRow> {
     let mut rows: Vec<_> = catalogs
         .values()
@@ -189,6 +230,10 @@ fn config_rows(
                         selected: selection.map(SkillSelection::mode),
                         gitignore: selection.is_some_and(SkillSelection::gitignore),
                         required_by,
+                        read_only: stale_aliases.contains(&catalog.alias),
+                        status: stale_aliases
+                            .contains(&catalog.alias)
+                            .then_some("stale".to_owned()),
                     }
                 })
         })
@@ -203,12 +248,46 @@ fn config_rows(
     rows
 }
 
+fn printed_catalog_statuses(
+    statuses: &BTreeMap<String, CatalogStatus>,
+    manifest: &ProjectConfig,
+    state: &InstalledState,
+) -> Vec<PrintedCatalogStatus> {
+    statuses
+        .values()
+        .map(|status| PrintedCatalogStatus {
+            alias: status.alias.clone(),
+            availability: match status.availability {
+                CatalogAvailability::Available => "available",
+                CatalogAvailability::Stale => "stale",
+                CatalogAvailability::Unavailable => "unavailable",
+            },
+            stale: status.availability == CatalogAvailability::Stale,
+            declared_count: manifest
+                .skills
+                .keys()
+                .filter(|key| key.starts_with(&format!("{}/", status.alias)))
+                .count(),
+            installed_count: state
+                .skills
+                .keys()
+                .filter(|key| key.starts_with(&format!("{}/", status.alias)))
+                .count(),
+            warning: status.warning.clone(),
+        })
+        .collect()
+}
+
 fn apply_assignments(
     manifest: &mut ProjectConfig,
     rows: &[ConfigRow],
     assignments: &[String],
 ) -> Result<()> {
-    let available: BTreeSet<_> = rows.iter().map(|row| row.key.as_str()).collect();
+    let available: BTreeSet<_> = rows
+        .iter()
+        .filter(|row| !row.read_only)
+        .map(|row| row.key.as_str())
+        .collect();
     let mut seen = BTreeSet::new();
     for assignment in assignments {
         let (key, mode) = assignment.split_once('=').with_context(|| {
@@ -255,7 +334,11 @@ fn apply_gitignore_assignments(
     if global_scope && !assignments.is_empty() {
         anyhow::bail!("global skill configuration does not support Git ignore state");
     }
-    let available: BTreeSet<_> = rows.iter().map(|row| row.key.as_str()).collect();
+    let available: BTreeSet<_> = rows
+        .iter()
+        .filter(|row| !row.read_only)
+        .map(|row| row.key.as_str())
+        .collect();
     let mut seen = BTreeSet::new();
     for assignment in assignments {
         let (key, value) = assignment.split_once('=').with_context(|| {
@@ -321,6 +404,7 @@ fn maybe_install(
     scope: InstallScope,
     manifest: &ProjectConfig,
     catalogs: &BTreeMap<String, CatalogIndex>,
+    unavailable_aliases: &BTreeSet<String>,
 ) -> Result<()> {
     let command = if scope.is_global() {
         "skiller install -g"
@@ -329,7 +413,12 @@ fn maybe_install(
     };
     let answer = prompt(&format!("Run `{command}` now? [y/N]: "))?;
     if answer == "y" || answer == "yes" {
-        install_with_catalogs(scope, manifest, catalogs)?;
+        crate::installer::install_with_catalogs_preserving(
+            scope,
+            manifest,
+            catalogs,
+            unavailable_aliases,
+        )?;
     }
     Ok(())
 }
@@ -382,6 +471,8 @@ mod tests {
             installed: false,
             installed_mode: None,
             required_by: Vec::new(),
+            read_only: false,
+            status: None,
         }];
         let mut manifest = ProjectConfig::default();
         apply_assignments(&mut manifest, &rows, &["pyg/develop=enable".to_owned()]).unwrap();
@@ -429,6 +520,47 @@ mod tests {
                 false,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_rows_are_read_only_and_status_counts_include_unavailable_catalogs() {
+        let status = CatalogStatus {
+            alias: "offline".to_owned(),
+            availability: CatalogAvailability::Unavailable,
+            warning: Some("network unavailable".to_owned()),
+            catalog: None,
+        };
+        let manifest = ProjectConfig {
+            version: SCHEMA_VERSION,
+            skills: BTreeMap::from([(
+                "offline/root".to_owned(),
+                SkillSelection::Mode(SelectionMode::Enable),
+            )]),
+            agents: crate::model::default_agents(),
+        };
+        let state = InstalledState {
+            version: crate::model::INSTALLED_STATE_VERSION,
+            skills: BTreeMap::from([(
+                "offline/root".to_owned(),
+                InstalledSkill {
+                    installed_name: "root".to_owned(),
+                    mode: EffectiveMode::Enable,
+                    gitignore: false,
+                    digest: None,
+                    legacy_path: None,
+                },
+            )]),
+        };
+        let report = printed_catalog_statuses(
+            &BTreeMap::from([("offline".to_owned(), status)]),
+            &manifest,
+            &state,
+        );
+        assert_eq!(report[0].availability, "unavailable");
+        assert_eq!(
+            (report[0].declared_count, report[0].installed_count),
+            (1, 1)
         );
     }
 
@@ -483,10 +615,18 @@ mod tests {
         let catalogs = BTreeMap::from([("pyg".to_owned(), catalog)]);
         let manifest = ProjectConfig::default();
         let state = InstalledState::default();
-        let global = config_rows(&catalogs, &state, &manifest, true);
-        let project = config_rows(&catalogs, &state, &manifest, false);
+        let global = config_rows(
+            &catalogs,
+            &state,
+            &manifest,
+            true,
+            &BTreeSet::from(["pyg".to_owned()]),
+        );
+        let project = config_rows(&catalogs, &state, &manifest, false, &BTreeSet::new());
         assert_eq!(global[0].name, "global");
         assert_eq!(global[0].installed_name, "global-scope");
+        assert!(global[0].read_only);
+        assert_eq!(global[0].status.as_deref(), Some("stale"));
         assert_eq!(project[0].name, "project");
         assert_eq!(project[0].installed_name, "project-scope");
     }
