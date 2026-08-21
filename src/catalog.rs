@@ -141,7 +141,7 @@ pub fn add_skill(
     let skills_root = root.join("skills");
     ensure_real_dir(&skills_root)?;
     let destination = skills_root.join(&skill.name);
-    if destination.exists() {
+    if std::fs::symlink_metadata(&destination).is_ok() {
         bail!(
             "catalog skill destination already exists: {}",
             destination.display()
@@ -152,7 +152,7 @@ pub fn add_skill(
         std::process::id(),
         skill.name
     ));
-    if staging.exists() {
+    if std::fs::symlink_metadata(&staging).is_ok() {
         bail!(
             "catalog add staging path already exists: {}",
             staging.display()
@@ -260,7 +260,7 @@ fn clone_candidates(source: &str) -> Vec<String> {
     }
 }
 
-fn scan_catalog(alias: &str, source: &str, root: &Path) -> Result<CatalogIndex> {
+pub(crate) fn scan_catalog(alias: &str, source: &str, root: &Path) -> Result<CatalogIndex> {
     let metadata_path = root.join("skiller.json");
     let metadata: CatalogMetadata = if metadata_path.exists() {
         let value: CatalogMetadata = read_json(&metadata_path)?;
@@ -331,6 +331,10 @@ fn scan_catalog(alias: &str, source: &str, root: &Path) -> Result<CatalogIndex> 
     })
 }
 
+pub(crate) fn source_skill_name(directory: &Path) -> Result<String> {
+    Ok(read_skill_directory(directory, CatalogSkillMetadata::default())?.name)
+}
+
 fn read_skill_directory(directory: &Path, metadata: CatalogSkillMetadata) -> Result<CatalogSkill> {
     let skill_path = directory.join("SKILL.md");
     let raw = std::fs::read_to_string(&skill_path)
@@ -370,16 +374,12 @@ fn read_skill_directory(directory: &Path, metadata: CatalogSkillMetadata) -> Res
     })
 }
 
-pub fn installed_name(name: &str, scope: Option<&str>) -> Result<String> {
+pub fn installed_name(name: &str, _scope: Option<&str>) -> Result<String> {
     // ^ Agent Skills names and matching folder names: https://agentskills.io/specification
-    let value = match scope {
-        Some(scope) => format!("{name}-{scope}"),
-        None => name.to_owned(),
-    };
-    if !valid_name(&value) {
-        bail!("postfixed skill name is not Agent Skills compatible: {value}");
+    if !valid_name(name) {
+        bail!("skill name is not Agent Skills compatible: {name}");
     }
-    Ok(value)
+    Ok(name.to_owned())
 }
 
 fn frontmatter<'a>(raw: &'a str, path: &Path) -> Result<&'a str> {
@@ -529,12 +529,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scope_is_postfixed_with_portable_separator() {
+    fn scope_does_not_change_the_installed_name() {
         assert_eq!(
             installed_name("develop", Some("engineering")).unwrap(),
-            "develop-engineering"
+            "develop"
         );
-        assert!(installed_name(&"a".repeat(60), Some("scope")).is_err());
+        assert!(installed_name(&"a".repeat(65), Some("scope")).is_err());
     }
 
     #[test]

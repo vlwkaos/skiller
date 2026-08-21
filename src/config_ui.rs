@@ -12,8 +12,8 @@ use crate::model::{
     validate_installed_state, validate_schema,
 };
 use crate::paths::{
-    global_config_path, global_skills_root, global_state_path, read_json_or_default,
-    write_global_config, write_json_atomic,
+    global_config_path, global_state_path, read_json_or_default, write_global_config,
+    write_json_atomic,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,6 +39,7 @@ pub(crate) struct ConfigRow {
 struct PrintedConfig<'a> {
     scope: &'a str,
     config_path: String,
+    agents: &'a [String],
     skills: &'a [ConfigRow],
 }
 
@@ -47,43 +48,37 @@ pub fn configure(
     print_only: bool,
     assignments: &[String],
     gitignore_assignments: &[String],
+    agents: &[String],
 ) -> Result<()> {
     let mut global_config = load_global_config()?;
     if global_config.catalogs.is_empty() {
         anyhow::bail!("no catalogs configured; run `skiller add-catalog <alias> <source>`");
     }
     let catalogs = sync_registered_catalogs(&global_config)?;
-    let (config_path, state_path, target_root, mut manifest) = match &scope {
+    let (config_path, state_path, mut manifest) = match &scope {
         InstallScope::Project(project_root) => {
             let config_path = project_root.join("skiller.config.json");
             let manifest: ProjectConfig = read_json_or_default(&config_path)?;
             (
                 config_path,
                 project_root.join(".skiller/installed.json"),
-                project_root.join(".agents/skills"),
                 manifest,
             )
         }
         InstallScope::Global => (
             global_config_path()?,
             global_state_path()?,
-            global_skills_root()?,
             ProjectConfig {
                 version: global_config.version,
                 skills: global_config.skills.clone(),
+                agents: global_config.agents.clone(),
             },
         ),
     };
     validate_schema(manifest.version, "skill config")?;
     let state: InstalledState = read_json_or_default(&state_path)?;
     validate_installed_state(state.version)?;
-    let rows = config_rows(
-        &catalogs,
-        &state,
-        &target_root,
-        &manifest,
-        scope.is_global(),
-    );
+    let rows = config_rows(&catalogs, &state, &manifest, scope.is_global());
 
     if print_only {
         let output = PrintedConfig {
@@ -93,12 +88,13 @@ pub fn configure(
                 "project"
             },
             config_path: config_path.display().to_string(),
+            agents: &manifest.agents,
             skills: &rows,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
     }
-    if !assignments.is_empty() || !gitignore_assignments.is_empty() {
+    if !assignments.is_empty() || !gitignore_assignments.is_empty() || !agents.is_empty() {
         apply_assignments(&mut manifest, &rows, assignments)?;
         apply_gitignore_assignments(
             &mut manifest,
@@ -106,6 +102,10 @@ pub fn configure(
             gitignore_assignments,
             scope.is_global(),
         )?;
+        if !agents.is_empty() {
+            crate::installer::validate_agents(agents)?;
+            manifest.agents = agents.to_vec();
+        }
         save_manifest(&scope, &config_path, &manifest, &mut global_config)?;
         println!("saved {}", config_path.display());
         return Ok(());
@@ -131,6 +131,7 @@ fn save_manifest(
         InstallScope::Project(_) => write_json_atomic(path, manifest),
         InstallScope::Global => {
             global_config.skills = manifest.skills.clone();
+            global_config.agents = manifest.agents.clone();
             write_global_config(global_config)
         }
     }
@@ -143,7 +144,6 @@ fn installed_name_is_current(installed: &crate::model::InstalledSkill, desired_n
 fn config_rows(
     catalogs: &BTreeMap<String, CatalogIndex>,
     state: &InstalledState,
-    target_root: &Path,
     manifest: &ProjectConfig,
     global_scope: bool,
 ) -> Vec<ConfigRow> {
@@ -171,13 +171,10 @@ fn config_rows(
                         .map(|candidate| candidate.name.clone())
                         .collect();
                     required_by.sort();
-                    let installed = state.skills.get(&key).filter(|installed| {
-                        installed_name_is_current(installed, &installed_name)
-                            && target_root
-                                .join(&installed.installed_name)
-                                .join("SKILL.md")
-                                .is_file()
-                    });
+                    let installed = state
+                        .skills
+                        .get(&key)
+                        .filter(|installed| installed_name_is_current(installed, &installed_name));
                     ConfigRow {
                         key: key.clone(),
                         catalog: catalog.alias.clone(),
@@ -332,7 +329,7 @@ fn maybe_install(
     };
     let answer = prompt(&format!("Run `{command}` now? [y/N]: "))?;
     if answer == "y" || answer == "yes" {
-        install_with_catalogs(scope, manifest, catalogs, false)?;
+        install_with_catalogs(scope, manifest, catalogs)?;
     }
     Ok(())
 }
@@ -359,6 +356,7 @@ mod tests {
         let mut manifest = ProjectConfig {
             version: SCHEMA_VERSION,
             skills: BTreeMap::new(),
+            agents: crate::model::default_agents(),
         };
         cycle_selection(&mut manifest, "pyg/develop");
         assert_eq!(manifest.skills["pyg/develop"].mode(), SelectionMode::Enable);
@@ -435,18 +433,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_unpostfixed_state_does_not_match_a_postfixed_row() {
+    fn stale_postfixed_state_does_not_match_a_clean_name_row() {
         let installed = InstalledSkill {
-            installed_name: "develop".to_owned(),
+            installed_name: "develop-engineering".to_owned(),
             mode: EffectiveMode::Enable,
             gitignore: false,
             legacy_path: None,
         };
-        assert!(!installed_name_is_current(
-            &installed,
-            "develop-engineering"
-        ));
-        assert!(installed_name_is_current(&installed, "develop"));
+        assert!(!installed_name_is_current(&installed, "develop"));
+        assert!(installed_name_is_current(&installed, "develop-engineering"));
     }
 
     #[test]
@@ -484,8 +479,8 @@ mod tests {
         let catalogs = BTreeMap::from([("pyg".to_owned(), catalog)]);
         let manifest = ProjectConfig::default();
         let state = InstalledState::default();
-        let global = config_rows(&catalogs, &state, Path::new("."), &manifest, true);
-        let project = config_rows(&catalogs, &state, Path::new("."), &manifest, false);
+        let global = config_rows(&catalogs, &state, &manifest, true);
+        let project = config_rows(&catalogs, &state, &manifest, false);
         assert_eq!(global[0].name, "global");
         assert_eq!(global[0].installed_name, "global-scope");
         assert_eq!(project[0].name, "project");

@@ -6,6 +6,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub const SCHEMA_VERSION: u32 = 1;
 pub const INSTALLED_STATE_VERSION: u32 = 2;
 
+pub fn default_agents() -> Vec<String> {
+    ["universal", "claude-code", "pi"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalConfig {
@@ -15,6 +22,8 @@ pub struct GlobalConfig {
     pub catalogs: BTreeMap<String, CatalogRegistration>,
     #[serde(default)]
     pub skills: BTreeMap<String, SkillSelection>,
+    #[serde(default = "default_agents")]
+    pub agents: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,6 +39,8 @@ pub struct ProjectConfig {
     pub version: u32,
     #[serde(default)]
     pub skills: BTreeMap<String, SkillSelection>,
+    #[serde(default = "default_agents")]
+    pub agents: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -288,6 +299,7 @@ impl Default for GlobalConfig {
             version: SCHEMA_VERSION,
             catalogs: BTreeMap::new(),
             skills: BTreeMap::new(),
+            agents: default_agents(),
         }
     }
 }
@@ -297,6 +309,7 @@ impl Default for ProjectConfig {
         Self {
             version: SCHEMA_VERSION,
             skills: BTreeMap::new(),
+            agents: default_agents(),
         }
     }
 }

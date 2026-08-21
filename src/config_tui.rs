@@ -255,6 +255,7 @@ mod tests {
         let mut manifest = ProjectConfig {
             version: SCHEMA_VERSION,
             skills: BTreeMap::new(),
+            agents: crate::model::default_agents(),
         };
         cycle_selection(&mut manifest, "pyg/develop");
         let lines = view_lines(&rows, &manifest, true, 0, 52, 10);

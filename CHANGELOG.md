@@ -1,3 +1,17 @@
+## [0.6.0] - 2026-08-21
+
+### Features
+
+- Add guided and plan-driven legacy migration into explicit catalogs and configuration.
+- Persist configurable nonempty Vercel agent targets and verify them through Vercel JSON listing.
+- Add a bundled `skiller-migrate` Agent Skill for human and agent workflows.
+
+### Changed
+
+- Keep installed skill names unpostfixed and add semantic scope to projected descriptions.
+- Remove `install --migrate`; full migration now uses `skiller migrate`.
+- Replace the README with a concise command, configuration, catalog, and safety reference.
+
 ## [0.5.0] - 2026-08-21
 
 ### Features

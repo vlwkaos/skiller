@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{CatalogIndex, load_global_config, sync_registered_catalogs};
-use crate::manual::{apply_invocation_mode, rename_skill};
+use crate::manual::{apply_invocation_mode, apply_projected_identity};
 use crate::model::{
     EffectiveMode, INSTALLED_STATE_VERSION, InstalledSkill, InstalledState, ProjectConfig,
     SelectionMode, validate_installed_state, validate_schema,
@@ -18,7 +18,6 @@ use crate::paths::{
 };
 
 const VERCEL_SKILLS_PACKAGE: &str = "skills@1.5.23";
-const VERCEL_INSTALL_AGENTS: &[&str] = &["universal", "claude-code", "pi"];
 const IGNORE_START: &str = "# skiller:start";
 const IGNORE_END: &str = "# skiller:end";
 
@@ -71,7 +70,7 @@ pub(crate) struct TransactionJournal {
     pub(crate) remove: Vec<String>,
 }
 
-pub fn install(scope: InstallScope, migrate: bool) -> Result<()> {
+pub fn install(scope: InstallScope) -> Result<()> {
     let global_config = load_global_config()?;
     let catalogs = sync_registered_catalogs(&global_config)?;
     let manifest = match &scope {
@@ -82,29 +81,53 @@ pub fn install(scope: InstallScope, migrate: bool) -> Result<()> {
         InstallScope::Global => ProjectConfig {
             version: global_config.version,
             skills: global_config.skills,
+            agents: global_config.agents,
         },
     };
-    install_with_catalogs(scope, &manifest, &catalogs, migrate)
+    install_with_catalogs(scope, &manifest, &catalogs)
 }
 
 pub fn install_with_catalogs(
     scope: InstallScope,
     manifest: &ProjectConfig,
     catalogs: &BTreeMap<String, CatalogIndex>,
-    migrate: bool,
 ) -> Result<()> {
-    install_with_catalogs_recovery(scope, manifest, catalogs, migrate, &BTreeSet::new(), false)
+    install_with_catalogs_recovery(
+        scope,
+        manifest,
+        catalogs,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        false,
+    )
+}
+
+pub(crate) fn install_migration(
+    scope: InstallScope,
+    manifest: &ProjectConfig,
+    catalogs: &BTreeMap<String, CatalogIndex>,
+    legacy_names: &BTreeSet<String>,
+) -> Result<()> {
+    install_with_catalogs_recovery(
+        scope,
+        manifest,
+        catalogs,
+        legacy_names,
+        &BTreeSet::new(),
+        false,
+    )
 }
 
 pub(crate) fn install_with_catalogs_recovery(
     scope: InstallScope,
     manifest: &ProjectConfig,
     catalogs: &BTreeMap<String, CatalogIndex>,
-    migrate: bool,
-    recovery_owned: &BTreeSet<String>,
+    replacement_owned: &BTreeSet<String>,
+    cleanup_owned: &BTreeSet<String>,
     recovering: bool,
 ) -> Result<()> {
     validate_schema(manifest.version, "skill config")?;
+    validate_agents(&manifest.agents)?;
     let paths = install_paths(&scope)?;
     validate_managed_json_path(&paths.state_path)?;
     validate_managed_json_path(&paths.transaction_path)?;
@@ -150,17 +173,14 @@ pub(crate) fn install_with_catalogs_recovery(
 
     let result = (|| -> Result<()> {
         prepare_skills(&resolved, &staging_root, &prepared_root)?;
-        if migrate {
-            unlink_legacy_skill_roots(&paths.command_root, scope.is_global())?;
-        } else {
-            refuse_unowned_conflicts(
-                &paths.command_root,
-                scope.is_global(),
-                &previous,
-                &resolved,
-                recovery_owned,
-            )?;
-        }
+        refuse_unowned_conflicts(
+            &paths.command_root,
+            scope.is_global(),
+            &previous,
+            &resolved,
+            replacement_owned,
+            &manifest.agents,
+        )?;
         let desired_names: BTreeSet<_> = resolved
             .iter()
             .map(|skill| skill.installed_name.clone())
@@ -172,7 +192,7 @@ pub(crate) fn install_with_catalogs_recovery(
             .map(|skill| skill.installed_name.clone())
             .collect();
         removed.extend(
-            recovery_owned
+            cleanup_owned
                 .iter()
                 .filter(|name| !desired_names.contains(*name))
                 .cloned(),
@@ -190,11 +210,17 @@ pub(crate) fn install_with_catalogs_recovery(
             &paths.command_root,
             &prepared_root,
             &resolved,
+            &manifest.agents,
             scope.is_global(),
         )?;
         journal.phase = TransactionPhase::I;
         write_json_atomic_compact(&paths.transaction_path, &journal)?;
-        verify_installation(&paths.command_root, scope.is_global(), &resolved)?;
+        verify_installation(
+            &paths.command_root,
+            scope.is_global(),
+            &resolved,
+            &manifest.agents,
+        )?;
         journal.phase = TransactionPhase::V;
         write_json_atomic_compact(&paths.transaction_path, &journal)?;
         run_vercel_remove(
@@ -430,7 +456,12 @@ fn prepare_skills(
             }
             let destination = prepared_root.join("skills").join(&skill.installed_name);
             copy_tree(&source, &destination)?;
-            rename_skill(&destination, &skill.installed_name)?;
+            apply_projected_identity(
+                &destination,
+                &skill.installed_name,
+                skill.catalog.skills[&skill.source_name].scope.as_deref(),
+                &skill.catalog.skills[&skill.source_name].description,
+            )?;
             apply_invocation_mode(&destination, skill.mode)?;
         }
     }
@@ -457,6 +488,7 @@ fn run_vercel_install(
     command_root: &Path,
     prepared_root: &Path,
     resolved: &[ResolvedSkill<'_>],
+    agents: &[String],
     global_scope: bool,
 ) -> Result<()> {
     if resolved.is_empty() {
@@ -467,8 +499,8 @@ fn run_vercel_install(
     for skill in resolved {
         command.args(["--skill", &skill.installed_name]);
     }
-    // ^ skills@1.5.23 writes the universal canonical skill and explicit Claude Code/Pi projections.
-    append_vercel_install_targets(&mut command);
+    // ^ skills@1.5.23 owns placement for every persisted agent target.
+    append_vercel_install_targets(&mut command, agents);
     if global_scope {
         command.arg("--global");
     }
@@ -476,11 +508,33 @@ fn run_vercel_install(
     run_command(command, "installing prepared skills")
 }
 
-fn append_vercel_install_targets(command: &mut Command) {
-    command
-        .arg("--agent")
-        .args(VERCEL_INSTALL_AGENTS)
-        .arg("--yes");
+fn append_vercel_install_targets(command: &mut Command, agents: &[String]) {
+    command.arg("--agent").args(agents).arg("--yes");
+}
+
+pub(crate) fn validate_agents(agents: &[String]) -> Result<()> {
+    if agents.is_empty() {
+        bail!("skill configuration must select at least one Vercel agent");
+    }
+    let mut seen = BTreeSet::new();
+    for agent in agents {
+        if agent.trim().is_empty() || agent != agent.trim() || agent.chars().any(char::is_control) {
+            bail!("invalid empty or whitespace Vercel agent name");
+        }
+        if !seen.insert(agent) {
+            bail!("duplicate Vercel agent name: {agent}");
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn cleanup_legacy_names(scope: &InstallScope, names: &BTreeSet<String>) -> Result<()> {
+    let paths = install_paths(scope)?;
+    run_vercel_remove(
+        &paths.command_root,
+        &names.iter().cloned().collect::<Vec<_>>(),
+        scope.is_global(),
+    )
 }
 
 fn run_vercel_remove(command_root: &Path, names: &[String], global_scope: bool) -> Result<()> {
@@ -549,18 +603,6 @@ fn run_command(mut command: Command, action: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn required_projection_roots(command_root: &Path, global_scope: bool) -> [PathBuf; 3] {
-    [
-        command_root.join(".agents/skills"),
-        command_root.join(".claude/skills"),
-        command_root.join(if global_scope {
-            ".pi/agent/skills"
-        } else {
-            ".pi/skills"
-        }),
-    ]
-}
-
 pub(crate) fn projection_roots(command_root: &Path, global_scope: bool) -> Vec<PathBuf> {
     let relative_roots: &[&str] = if global_scope {
         &[
@@ -592,29 +634,13 @@ pub(crate) fn projection_roots(command_root: &Path, global_scope: bool) -> Vec<P
         .collect()
 }
 
-fn unlink_legacy_skill_roots(command_root: &Path, global_scope: bool) -> Result<()> {
-    for path in projection_roots(command_root, global_scope) {
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                std::fs::remove_file(&path)
-                    .with_context(|| format!("unlinking legacy skill root {}", path.display()))?;
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| format!("inspecting {}", path.display()));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn refuse_unowned_conflicts(
     command_root: &Path,
     global_scope: bool,
     previous: &InstalledState,
     resolved: &[ResolvedSkill<'_>],
     recovery_owned: &BTreeSet<String>,
+    agents: &[String],
 ) -> Result<()> {
     let mut owned: BTreeSet<_> = previous
         .skills
@@ -623,11 +649,18 @@ fn refuse_unowned_conflicts(
         .collect();
     owned.extend(recovery_owned.iter().map(String::as_str));
     let roots = projection_roots(command_root, global_scope);
+    let agent_names: Vec<_> = agents
+        .iter()
+        .map(|agent| list_agent_skill_names(command_root, global_scope, agent))
+        .collect::<Result<_>>()?;
     for skill in resolved {
         let conflict = roots
             .iter()
             .map(|root| root.join(&skill.installed_name))
-            .any(|path| path.exists() || path.is_symlink());
+            .any(|path| path.exists() || path.is_symlink())
+            || agent_names
+                .iter()
+                .any(|names| names.contains(&skill.installed_name));
         if conflict && !owned.contains(skill.installed_name.as_str()) {
             bail!(
                 "refusing to replace a skill not owned by Skiller: {}",
@@ -642,16 +675,49 @@ fn verify_installation(
     command_root: &Path,
     global_scope: bool,
     resolved: &[ResolvedSkill<'_>],
+    agents: &[String],
 ) -> Result<()> {
-    for root in required_projection_roots(command_root, global_scope) {
+    for agent in agents {
+        let installed = list_agent_skill_names(command_root, global_scope, agent)?;
         for skill in resolved {
-            let path = root.join(&skill.installed_name).join("SKILL.md");
-            if !path.is_file() {
-                bail!("Vercel Skills did not install {}", path.display());
+            if !installed.contains(&skill.installed_name) {
+                bail!(
+                    "Vercel Skills did not install {} for agent {agent}",
+                    skill.installed_name
+                );
             }
         }
     }
     Ok(())
+}
+
+pub(crate) fn list_agent_skill_names(
+    command_root: &Path,
+    global_scope: bool,
+    agent: &str,
+) -> Result<BTreeSet<String>> {
+    let mut command = vercel_command();
+    command.args(["list", "--json", "--agent", agent]);
+    if global_scope {
+        command.arg("--global");
+    }
+    command.current_dir(command_root);
+    let output = command
+        .output()
+        .with_context(|| format!("listing Vercel Skills for agent {agent}"))?;
+    if !output.status.success() {
+        bail!(
+            "Vercel Skills rejected agent {agent}: {}{}",
+            sanitize_child_output(&output.stdout),
+            sanitize_child_output(&output.stderr)
+        );
+    }
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parsing Vercel Skills list for agent {agent}"))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| row.get("name")?.as_str().map(str::to_owned))
+        .collect())
 }
 
 fn write_work_marker(root: &Path) -> Result<()> {
@@ -750,7 +816,7 @@ mod tests {
                         name: "root".to_owned(),
                         description: "Root".to_owned(),
                         scope: Some("engineering".to_owned()),
-                        installed_name: "root-engineering".to_owned(),
+                        installed_name: "root".to_owned(),
                         global,
                         requires: vec!["dependency".to_owned()],
                     },
@@ -761,7 +827,7 @@ mod tests {
                         name: "dependency".to_owned(),
                         description: "Dependency".to_owned(),
                         scope: Some("engineering".to_owned()),
-                        installed_name: "dependency-engineering".to_owned(),
+                        installed_name: "dependency".to_owned(),
                         global,
                         requires: Vec::new(),
                     },
@@ -778,13 +844,14 @@ mod tests {
                 "pyg/root".to_owned(),
                 SkillSelection::Mode(SelectionMode::Enable),
             )]),
+            agents: crate::model::default_agents(),
         };
         let catalogs = BTreeMap::from([("pyg".to_owned(), catalog(true))]);
         let resolved = resolve_manifest(&manifest, &catalogs, true).unwrap();
         assert_eq!(resolved.len(), 2);
-        assert_eq!(resolved[0].installed_name, "dependency-engineering");
+        assert_eq!(resolved[0].installed_name, "dependency");
         assert_eq!(resolved[0].mode, EffectiveMode::Dependency);
-        assert_eq!(resolved[1].installed_name, "root-engineering");
+        assert_eq!(resolved[1].installed_name, "root");
         assert_eq!(resolved[1].mode, EffectiveMode::Enable);
         assert!(resolve_manifest(&manifest, &catalogs, false).is_err());
     }
@@ -804,6 +871,7 @@ mod tests {
                     SkillSelection::Mode(SelectionMode::Manual),
                 ),
             ]),
+            agents: crate::model::default_agents(),
         };
         let resolved = resolve_manifest(&manifest, &catalogs, true).unwrap();
         assert_eq!(resolved[0].mode, EffectiveMode::Enable);
@@ -816,37 +884,10 @@ mod tests {
     }
 
     #[test]
-    fn verification_requires_universal_claude_and_pi_projections() {
-        let base = std::env::current_dir()
-            .unwrap()
-            .join("target/test-work/verify-projections");
-        let _ = std::fs::remove_dir_all(&base);
-        let catalog = catalog(true);
-        let skill = ResolvedSkill {
-            key: "pyg/root".to_owned(),
-            catalog: &catalog,
-            source_name: "root".to_owned(),
-            installed_name: "root-engineering".to_owned(),
-            mode: EffectiveMode::Enable,
-            gitignore: false,
-        };
-        for root in required_projection_roots(&base, true) {
-            std::fs::create_dir_all(root.join("root-engineering")).unwrap();
-            std::fs::write(root.join("root-engineering/SKILL.md"), "---\n---\n").unwrap();
-        }
-        verify_installation(&base, true, &[skill]).unwrap();
-        std::fs::remove_file(base.join(".claude/skills/root-engineering/SKILL.md")).unwrap();
-        assert!(verify_installation(&base, true, &[]).is_ok());
-        let skill = ResolvedSkill {
-            key: "pyg/root".to_owned(),
-            catalog: &catalog,
-            source_name: "root".to_owned(),
-            installed_name: "root-engineering".to_owned(),
-            mode: EffectiveMode::Enable,
-            gitignore: false,
-        };
-        assert!(verify_installation(&base, true, &[skill]).is_err());
-        std::fs::remove_dir_all(&base).unwrap();
+    fn agent_targets_are_configurable_but_cannot_be_empty_or_duplicate() {
+        assert!(validate_agents(&["claude-code".to_owned()]).is_ok());
+        assert!(validate_agents(&[]).is_err());
+        assert!(validate_agents(&["pi".to_owned(), "pi".to_owned()]).is_err());
     }
 
     #[test]
@@ -869,7 +910,7 @@ mod tests {
     #[test]
     fn vercel_install_targets_universal_claude_and_pi_explicitly() {
         let mut command = Command::new("skills");
-        append_vercel_install_targets(&mut command);
+        append_vercel_install_targets(&mut command, &crate::model::default_agents());
         let args: Vec<_> = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())

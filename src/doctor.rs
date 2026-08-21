@@ -8,8 +8,8 @@ use serde::Serialize;
 use crate::catalog::{CatalogIndex, load_global_config, resolve_rename, sync_registered_catalogs};
 use crate::installer::{
     InstallScope, TransactionJournal, TransactionPhase, install_paths,
-    install_with_catalogs_recovery, manifest_fingerprint, projection_roots,
-    required_projection_roots, resolve_manifest, validate_owned_state,
+    install_with_catalogs_recovery, list_agent_skill_names, manifest_fingerprint, projection_roots,
+    resolve_manifest, validate_agents, validate_owned_state,
 };
 use crate::model::{
     INSTALLED_STATE_VERSION, InstalledState, ProjectConfig, validate_installed_state,
@@ -65,6 +65,7 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
             return Ok(());
         }
     };
+    validate_agents(&inputs.manifest.agents)?;
     let paths = install_paths(&scope)?;
     let mut issues = Vec::new();
     let migrated =
@@ -273,6 +274,17 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
         if let Some(authorized) = &journal_authorization {
             owned_names.extend(authorized.iter().map(String::as_str));
         }
+        let agent_snapshots: BTreeMap<_, _> = migrated
+            .agents
+            .iter()
+            .map(|agent| {
+                (
+                    agent.as_str(),
+                    list_agent_skill_names(&paths.command_root, scope.is_global(), agent)
+                        .map_err(|error| error.to_string()),
+                )
+            })
+            .collect();
         for name in desired_names {
             for root in projection_roots(&paths.command_root, scope.is_global()) {
                 let entry = root.join(name);
@@ -287,10 +299,28 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
                     });
                 }
             }
-            for root in required_projection_roots(&paths.command_root, scope.is_global()) {
-                let entry = root.join(name);
-                if let Some(issue) = projection_issue(&entry, owned_names.contains(name)) {
-                    issues.push(issue);
+            for (agent, snapshot) in &agent_snapshots {
+                match snapshot {
+                    Ok(installed) if installed.contains(name) && !owned_names.contains(name) => {
+                        issues.push(DoctorIssue {
+                            code: "unowned-conflict",
+                            message: format!(
+                                "refusing to replace unowned {name} for Vercel agent {agent}"
+                            ),
+                            fixable: false,
+                        });
+                    }
+                    Ok(installed) if !installed.contains(name) => issues.push(DoctorIssue {
+                        code: "projection-drift",
+                        message: format!("{name} is missing for Vercel agent {agent}"),
+                        fixable: true,
+                    }),
+                    Ok(_) => {}
+                    Err(error) => issues.push(DoctorIssue {
+                        code: "agent-target",
+                        message: error.clone(),
+                        fixable: false,
+                    }),
                 }
             }
         }
@@ -327,7 +357,7 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
         scope,
         &migrated,
         &inputs.catalogs,
-        false,
+        &recovery_owned,
         &recovery_owned,
         journal.is_some(),
     )?;
@@ -352,6 +382,7 @@ fn load_inputs(scope: &InstallScope) -> Result<Inputs> {
             ProjectConfig {
                 version: global_config.version,
                 skills: global_config.skills.clone(),
+                agents: global_config.agents.clone(),
             },
         ),
     };
@@ -474,22 +505,6 @@ fn validate_name_list(kind: &str, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn projection_issue(entry: &Path, owned: bool) -> Option<DoctorIssue> {
-    if (entry.exists() || entry.is_symlink()) && !owned {
-        return Some(DoctorIssue {
-            code: "unowned-conflict",
-            message: format!("refusing to replace unowned projection {}", entry.display()),
-            fixable: false,
-        });
-    }
-    let skill_path = entry.join("SKILL.md");
-    (!skill_path.is_file()).then(|| DoctorIssue {
-        code: "projection-drift",
-        message: format!("missing or broken projection {}", skill_path.display()),
-        fixable: true,
-    })
-}
-
 fn stale_work_directories(work_root: &Path) -> Result<Vec<PathBuf>> {
     let parent = work_root
         .parent()
@@ -560,6 +575,7 @@ fn save_manifest(
         InstallScope::Global => {
             let mut config = global_config.clone();
             config.skills = manifest.skills.clone();
+            config.agents = manifest.agents.clone();
             write_global_config(&config)
         }
     }
@@ -652,7 +668,7 @@ mod tests {
                     name: "learn".to_owned(),
                     description: "Learn".to_owned(),
                     scope: Some("learning".to_owned()),
-                    installed_name: "learn-learning".to_owned(),
+                    installed_name: "learn".to_owned(),
                     global: true,
                     requires: Vec::new(),
                 },
@@ -668,6 +684,7 @@ mod tests {
                 "pyg/digest".to_owned(),
                 SkillSelection::Mode(SelectionMode::Manual),
             )]),
+            agents: crate::model::default_agents(),
         };
         let catalogs = BTreeMap::from([("pyg".to_owned(), renamed_catalog())]);
         let (migrated, messages) = migrate_declared_renames(&manifest, &catalogs, true).unwrap();
@@ -680,23 +697,6 @@ mod tests {
     }
 
     #[test]
-    fn valid_unowned_projection_blocks_repair() {
-        let base = std::env::current_dir()
-            .unwrap()
-            .join("target/test-work/doctor-unowned");
-        let _ = std::fs::remove_dir_all(&base);
-        let entry = base.join("alpha-test");
-        std::fs::create_dir_all(&entry).unwrap();
-        std::fs::write(entry.join("SKILL.md"), "---\nname: alpha-test\n---\n").unwrap();
-
-        let issue = projection_issue(&entry, false).unwrap();
-        assert_eq!(issue.code, "unowned-conflict");
-        assert!(!issue.fixable);
-        assert!(projection_issue(&entry, true).is_none());
-        std::fs::remove_dir_all(&base).unwrap();
-    }
-
-    #[test]
     fn transaction_cannot_claim_unowned_removals() {
         let manifest = ProjectConfig {
             version: SCHEMA_VERSION,
@@ -704,6 +704,7 @@ mod tests {
                 "pyg/learn".to_owned(),
                 SkillSelection::Mode(SelectionMode::Enable),
             )]),
+            agents: crate::model::default_agents(),
         };
         let catalogs = BTreeMap::from([("pyg".to_owned(), renamed_catalog())]);
         let resolved = resolve_manifest(&manifest, &catalogs, true).unwrap();
@@ -712,7 +713,7 @@ mod tests {
             scope: "g".to_owned(),
             phase: TransactionPhase::P,
             config: manifest_fingerprint(&manifest).unwrap(),
-            desired: vec!["learn-learning".to_owned()],
+            desired: vec!["learn".to_owned()],
             remove: vec!["victim".to_owned()],
         };
         assert!(
@@ -748,6 +749,7 @@ mod tests {
                     SkillSelection::Mode(SelectionMode::Enable),
                 ),
             ]),
+            agents: crate::model::default_agents(),
         };
         let catalogs = BTreeMap::from([("pyg".to_owned(), catalog)]);
         assert!(
@@ -772,6 +774,7 @@ mod tests {
                     SkillSelection::Mode(SelectionMode::Enable),
                 ),
             ]),
+            agents: crate::model::default_agents(),
         };
         let catalogs = BTreeMap::from([("pyg".to_owned(), renamed_catalog())]);
         assert!(migrate_declared_renames(&manifest, &catalogs, true).is_err());

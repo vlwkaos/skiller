@@ -4,6 +4,7 @@ mod config_ui;
 mod doctor;
 mod installer;
 mod manual;
+mod migration;
 mod model;
 mod paths;
 
@@ -43,7 +44,7 @@ enum Command {
         #[arg(short = 'g', long)]
         global: bool,
         /// Print machine-readable catalog, selection, and installed state
-        #[arg(long, conflicts_with_all = ["set", "set_gitignore"])]
+        #[arg(long, conflicts_with_all = ["set", "set_gitignore", "agent"])]
         print: bool,
         /// Set one or more selections as catalog/name=enable|manual|off
         #[arg(long, value_name = "SKILL=MODE")]
@@ -51,6 +52,9 @@ enum Command {
         /// Set project Git-ignore state as catalog/name=true|false
         #[arg(long, value_name = "SKILL=BOOL")]
         set_gitignore: Vec<String>,
+        /// Replace Vercel installation targets; repeat for multiple agents
+        #[arg(long, value_name = "AGENT")]
+        agent: Vec<String>,
     },
     /// Diagnose and explicitly repair catalog-managed configuration and installations
     Doctor {
@@ -67,14 +71,29 @@ enum Command {
         #[arg(long, requires = "repair")]
         yes: bool,
     },
+    /// Guide legacy skills into a catalog, configuration, and verified installation
+    Migrate {
+        /// Create an editable migration-plan template
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["plan", "check", "apply", "yes"])]
+        init: Option<PathBuf>,
+        /// Read a deterministic migration plan
+        #[arg(long, value_name = "PATH", conflicts_with = "init")]
+        plan: Option<PathBuf>,
+        /// Validate and print the plan without mutation
+        #[arg(long, requires = "plan", conflicts_with = "apply")]
+        check: bool,
+        /// Apply the validated plan
+        #[arg(long, requires = "plan", conflicts_with = "check")]
+        apply: bool,
+        /// Confirm noninteractive application
+        #[arg(long, requires = "apply")]
+        yes: bool,
+    },
     /// Reconcile catalog-managed skills through Vercel Skills
     Install {
         /// Install globally instead of into the current project
         #[arg(short = 'g', long)]
         global: bool,
-        /// Adopt and replace same-name legacy installations after staging succeeds
-        #[arg(long)]
-        migrate: bool,
     },
 }
 
@@ -131,13 +150,14 @@ fn main() -> Result<()> {
             print,
             set,
             set_gitignore,
+            agent,
         } => {
             let scope = if global {
                 installer::InstallScope::Global
             } else {
                 installer::InstallScope::Project(paths::project_root()?)
             };
-            config_ui::configure(scope, print, &set, &set_gitignore)
+            config_ui::configure(scope, print, &set, &set_gitignore, &agent)
         }
         Command::Doctor {
             global,
@@ -152,13 +172,25 @@ fn main() -> Result<()> {
             };
             doctor::run(scope, print, repair, yes)
         }
-        Command::Install { global, migrate } => {
+        Command::Migrate {
+            init,
+            plan,
+            check: _,
+            apply,
+            yes,
+        } => match (init, plan) {
+            (Some(path), None) => migration::initialize(&path),
+            (None, Some(path)) => migration::run_plan(&path, apply, yes),
+            (None, None) => migration::interactive(),
+            (Some(_), Some(_)) => unreachable!("Clap rejects conflicting migration inputs"),
+        },
+        Command::Install { global } => {
             let scope = if global {
                 installer::InstallScope::Global
             } else {
                 installer::InstallScope::Project(paths::project_root()?)
             };
-            installer::install(scope, migrate)
+            installer::install(scope)
         }
     }
 }
@@ -172,6 +204,33 @@ mod tests {
         assert!(Cli::try_parse_from(["skiller", "doctor", "--yes"]).is_err());
         assert!(Cli::try_parse_from(["skiller", "doctor", "--repair", "--print"]).is_err());
         assert!(Cli::try_parse_from(["skiller", "doctor", "-g", "--repair", "--yes"]).is_ok());
+    }
+
+    #[test]
+    fn migration_cli_separates_check_apply_and_noninteractive_confirmation() {
+        assert!(Cli::try_parse_from(["skiller", "migrate", "--yes"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "skiller",
+                "migrate",
+                "--plan",
+                "plan.json",
+                "--check",
+                "--apply"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "skiller",
+                "migrate",
+                "--plan",
+                "plan.json",
+                "--apply",
+                "--yes"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

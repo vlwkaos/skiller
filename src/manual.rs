@@ -26,11 +26,33 @@ pub fn apply_invocation_mode(skill_root: &Path, mode: EffectiveMode) -> Result<(
     )
 }
 
-pub fn rename_skill(skill_root: &Path, installed_name: &str) -> Result<()> {
+pub fn set_skill_name(skill_root: &Path, name: &str) -> Result<()> {
     let skill_md = skill_root.join("SKILL.md");
     let raw = std::fs::read_to_string(&skill_md)
         .with_context(|| format!("reading {}", skill_md.display()))?;
-    let updated = set_frontmatter_field(&raw, "name", Some(installed_name))?;
+    let updated = set_frontmatter_field(&raw, "name", Some(name))?;
+    std::fs::write(&skill_md, updated).with_context(|| format!("writing {}", skill_md.display()))
+}
+
+pub fn apply_projected_identity(
+    skill_root: &Path,
+    installed_name: &str,
+    scope: Option<&str>,
+    description: &str,
+) -> Result<()> {
+    let skill_md = skill_root.join("SKILL.md");
+    let raw = std::fs::read_to_string(&skill_md)
+        .with_context(|| format!("reading {}", skill_md.display()))?;
+    let description = match scope {
+        Some(scope) => format!("[{scope}] {description}"),
+        None => description.to_owned(),
+    };
+    let quoted = serde_json::to_string(&description)?;
+    let updated = set_frontmatter_field(
+        &set_frontmatter_field(&raw, "name", Some(installed_name))?,
+        "description",
+        Some(&quoted),
+    )?;
     std::fs::write(&skill_md, updated).with_context(|| format!("writing {}", skill_md.display()))
 }
 
@@ -154,6 +176,26 @@ mod tests {
                 .unwrap()
                 .contains("user-invocable")
         );
+    }
+
+    #[test]
+    fn projected_identity_keeps_name_clean_and_prefixes_scope_description() {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/projected-identity");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("SKILL.md"),
+            "---\nname: commit\ndescription: Create safe commits\n---\n",
+        )
+        .unwrap();
+        apply_projected_identity(&base, "commit", Some("engineering"), "Create safe commits")
+            .unwrap();
+        let raw = std::fs::read_to_string(base.join("SKILL.md")).unwrap();
+        assert!(raw.contains("name: commit\n"));
+        assert!(raw.contains("description: \"[engineering] Create safe commits\""));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
