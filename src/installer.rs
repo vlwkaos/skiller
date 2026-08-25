@@ -1,20 +1,24 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{CatalogIndex, load_global_config, sync_registered_catalogs_resilient};
+use crate::catalog::{
+    CatalogIndex, directory_digest, load_global_config, sync_registered_catalogs_resilient,
+};
 use crate::manual::{apply_invocation_mode, apply_projected_identity};
 use crate::model::{
     EffectiveMode, INSTALLED_STATE_VERSION, InstalledSkill, InstalledState, ProjectConfig,
     SelectionMode, validate_installed_state, validate_schema,
 };
 use crate::paths::{
-    cache_root, copy_tree, ensure_real_dir, global_skills_root, global_state_path, read_json,
-    read_json_or_default, safe_remove_owned_dir, sanitize_child_output, validate_managed_json_path,
-    write_json_atomic_compact, write_json_exclusive_compact,
+    cache_root, copy_tree, ensure_real_dir, global_skills_root, global_state_path, output_bounded,
+    read_json, read_json_or_default, safe_remove_owned_dir, sanitize_child_output,
+    validate_managed_json_path, write_global_config, write_json_atomic, write_json_atomic_compact,
+    write_json_exclusive_compact,
 };
 
 const VERCEL_SKILLS_PACKAGE: &str = "skills@1.5.23";
@@ -33,7 +37,7 @@ impl InstallScope {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ResolvedSkill<'a> {
     pub(crate) key: String,
     catalog: &'a CatalogIndex,
@@ -71,6 +75,12 @@ pub(crate) struct TransactionJournal {
     pub(crate) remove: Vec<String>,
 }
 
+struct ReconcileSelection {
+    install_names: BTreeSet<String>,
+    complete_names: BTreeSet<String>,
+    blocked: Vec<String>,
+}
+
 pub fn install(scope: InstallScope) -> Result<()> {
     let global_config = load_global_config()?;
     let sync = sync_registered_catalogs_resilient(&global_config)?;
@@ -87,18 +97,50 @@ pub fn install(scope: InstallScope) -> Result<()> {
     }
     let unavailable_aliases = sync.unavailable_aliases();
     let catalogs = sync.catalogs;
-    let manifest = match &scope {
+    let (config_path, manifest) = match &scope {
         InstallScope::Project(project_root) => {
             let path = project_root.join("skiller.config.json");
-            read_json(&path).with_context(|| "run `skiller config` before installing")?
+            let manifest =
+                read_json(&path).with_context(|| "run `skiller config` before installing")?;
+            (Some(path), manifest)
         }
-        InstallScope::Global => ProjectConfig {
-            version: global_config.version,
-            skills: global_config.skills,
-            agents: global_config.agents,
-        },
+        InstallScope::Global => (
+            None,
+            ProjectConfig {
+                version: global_config.version,
+                skills: global_config.skills.clone(),
+                agents: global_config.agents.clone(),
+            },
+        ),
     };
-    install_with_catalogs_preserving(scope, &manifest, &catalogs, &unavailable_aliases)
+    let active = manifest_without_unavailable(&manifest, &unavailable_aliases);
+    let (migrated_active, messages) =
+        crate::doctor::migrate_declared_renames(&active, &catalogs, scope.is_global())?;
+    let mut migrated = manifest.clone();
+    migrated
+        .skills
+        .retain(|key, _| key_alias(key).is_some_and(|alias| unavailable_aliases.contains(alias)));
+    migrated.skills.extend(migrated_active.skills);
+    if migrated != manifest {
+        match &scope {
+            InstallScope::Project(_) => write_json_atomic(
+                config_path
+                    .as_deref()
+                    .context("project config path is missing")?,
+                &migrated,
+            )?,
+            InstallScope::Global => {
+                let mut updated = global_config;
+                updated.skills = migrated.skills.clone();
+                updated.agents = migrated.agents.clone();
+                write_global_config(&updated)?;
+            }
+        }
+        for message in messages {
+            println!("repaired: {message}");
+        }
+    }
+    install_with_catalogs_preserving(scope, &migrated, &catalogs, &unavailable_aliases)
 }
 
 pub(crate) fn install_with_catalogs_preserving(
@@ -149,18 +191,49 @@ pub(crate) fn install_with_catalogs_recovery(
     let paths = install_paths(&scope)?;
     validate_managed_json_path(&paths.state_path)?;
     validate_managed_json_path(&paths.transaction_path)?;
-    if paths.transaction_path.exists() && !recovering {
-        bail!(
-            "an unfinished Skiller transaction exists at {}; run `skiller doctor{} --repair`",
-            paths.transaction_path.display(),
-            if scope.is_global() { " -g" } else { "" }
-        );
-    }
+    let pending_journal = if paths.transaction_path.exists() && !recovering {
+        Some(
+            read_json::<TransactionJournal>(&paths.transaction_path).with_context(|| {
+                format!(
+                    "reading unfinished transaction {}",
+                    paths.transaction_path.display()
+                )
+            })?,
+        )
+    } else {
+        None
+    };
     let previous: InstalledState = read_json_or_default(&paths.state_path)?;
     validate_installed_state(previous.version)?;
     validate_owned_state(&previous, paths.state_prefix)?;
     let active_manifest = manifest_without_unavailable(manifest, unavailable_aliases);
     let resolved = resolve_manifest(&active_manifest, catalogs, scope.is_global())?;
+    let mut effective_replacement_owned = replacement_owned.clone();
+    let mut effective_recovering = recovering;
+    if let Some(journal) = &pending_journal {
+        let scope_code = if scope.is_global() { "g" } else { "p" };
+        let desired_names: BTreeSet<_> = resolved
+            .iter()
+            .map(|skill| skill.installed_name.as_str())
+            .collect();
+        if journal.v != 1
+            || journal.scope != scope_code
+            || journal.config != manifest_fingerprint(&active_manifest)?
+            || journal
+                .desired
+                .iter()
+                .any(|name| !desired_names.contains(name.as_str()))
+        {
+            bail!(
+                "unfinished transaction is not safe for inline recovery; run `skiller doctor{} --print`",
+                if scope.is_global() { " -g" } else { "" }
+            );
+        }
+        effective_replacement_owned.extend(journal.desired.iter().cloned());
+        effective_replacement_owned.extend(journal.remove.iter().cloned());
+        effective_recovering = true;
+        println!("recovery: resuming a validated interrupted installation");
+    }
     let preserved: BTreeMap<_, _> = previous
         .skills
         .iter()
@@ -181,6 +254,17 @@ pub(crate) fn install_with_catalogs_recovery(
         );
     }
 
+    let environment_issues = preflight_environment(&paths, scope.is_global())?;
+    if !environment_issues.is_empty() {
+        println!(
+            "install preflight found {} environment issue(s):",
+            environment_issues.len()
+        );
+        for issue in &environment_issues {
+            println!("- [environment-permission] {issue}");
+        }
+        bail!("install preflight failed before projection mutation");
+    }
     ensure_real_dir(
         paths
             .work_root
@@ -188,141 +272,158 @@ pub(crate) fn install_with_catalogs_recovery(
             .context("managed work root has no parent")?,
     )?;
     ensure_real_dir(&paths.work_root)?;
-    let staging_root = paths
-        .work_root
-        .join(format!("staging-{}", std::process::id()));
     let prepared_root = paths
         .work_root
         .join(format!("prepared-{}", std::process::id()));
     let stable_prepared_root = paths.work_root.join("prepared-current");
     let setup = (|| -> Result<()> {
-        safe_remove_owned_dir(&staging_root, &paths.work_root)?;
         safe_remove_owned_dir(&prepared_root, &paths.work_root)?;
-        ensure_real_dir(&staging_root)?;
         ensure_real_dir(&prepared_root.join("skills"))?;
-        write_work_marker(&staging_root)?;
         write_work_marker(&prepared_root)?;
         Ok(())
     })();
     if let Err(error) = setup {
-        let _ = safe_remove_owned_dir(&staging_root, &paths.work_root);
         let _ = safe_remove_owned_dir(&prepared_root, &paths.work_root);
         return Err(error);
     }
 
-    let result = (|| -> Result<()> {
-        prepare_skills(&resolved, &staging_root, &prepared_root)?;
-        refuse_unowned_conflicts(
+    let mut changed = false;
+    let result = (|| -> Result<Vec<String>> {
+        prepare_skills(&resolved, &prepared_root)?;
+        let selection = classify_reconciliation(
             &paths.command_root,
             scope.is_global(),
             &previous,
             &resolved,
-            replacement_owned,
+            &effective_replacement_owned,
             &manifest.agents,
+            &prepared_root,
         )?;
-        let desired_names: BTreeSet<_> = resolved
+        let eligible: Vec<_> = resolved
+            .iter()
+            .filter(|skill| selection.install_names.contains(&skill.installed_name))
+            .cloned()
+            .collect();
+        let desired_names: BTreeSet<_> = eligible
             .iter()
             .map(|skill| skill.installed_name.clone())
-            .chain(preserved.values().map(|skill| skill.installed_name.clone()))
+            .chain(selection.complete_names.iter().cloned())
             .collect();
-        let mut removed: BTreeSet<_> = previous
-            .skills
-            .iter()
-            .filter(|(key, skill)| {
-                !preserved.contains_key(*key) && !desired_names.contains(&skill.installed_name)
-            })
-            .map(|(_, skill)| skill.installed_name.clone())
-            .collect();
-        removed.extend(
-            cleanup_owned
+        let removed: BTreeSet<_> = if selection.blocked.is_empty() {
+            previous
+                .skills
                 .iter()
-                .filter(|name| !desired_names.contains(*name))
-                .cloned(),
-        );
-        let mut journal = TransactionJournal {
-            v: 1,
-            scope: if scope.is_global() { "g" } else { "p" }.to_owned(),
-            phase: TransactionPhase::P,
-            config: manifest_fingerprint(&active_manifest)?,
-            desired: desired_names.iter().cloned().collect(),
-            remove: removed.iter().cloned().collect(),
-        };
-        if recovering {
-            write_json_atomic_compact(&paths.transaction_path, &journal)?;
+                .filter(|(key, skill)| {
+                    !preserved.contains_key(*key)
+                        && !resolved
+                            .iter()
+                            .any(|desired| desired.installed_name == skill.installed_name)
+                })
+                .map(|(_, skill)| skill.installed_name.clone())
+                .chain(cleanup_owned.iter().cloned())
+                .collect()
         } else {
-            write_json_exclusive_compact(&paths.transaction_path, &journal)?;
-        }
-        safe_remove_owned_dir(&stable_prepared_root, &paths.work_root)?;
-        std::fs::rename(&prepared_root, &stable_prepared_root).with_context(|| {
-            format!(
-                "promoting prepared installation source to {}",
-                stable_prepared_root.display()
-            )
-        })?;
-        run_vercel_install(
-            &paths.command_root,
-            &stable_prepared_root,
-            &resolved,
-            &manifest.agents,
-            scope.is_global(),
-        )?;
-        journal.phase = TransactionPhase::I;
-        write_json_atomic_compact(&paths.transaction_path, &journal)?;
-        retry_missing_installations(
-            &paths.command_root,
-            &stable_prepared_root,
-            scope.is_global(),
-            &resolved,
-            &manifest.agents,
-        )?;
-        verify_installation(
-            &paths.command_root,
-            scope.is_global(),
-            &resolved,
-            &manifest.agents,
-        )?;
-        journal.phase = TransactionPhase::V;
-        write_json_atomic_compact(&paths.transaction_path, &journal)?;
-        run_vercel_remove(
-            &paths.command_root,
-            &removed.into_iter().collect::<Vec<_>>(),
-            scope.is_global(),
-        )?;
-        journal.phase = TransactionPhase::C;
-        write_json_atomic_compact(&paths.transaction_path, &journal)?;
-
-        let mut next_skills = preserved;
-        next_skills.extend(resolved.iter().map(|skill| {
-            (
-                skill.key.clone(),
-                InstalledSkill {
-                    installed_name: skill.installed_name.clone(),
-                    mode: skill.mode,
-                    gitignore: skill.gitignore,
-                    digest: Some(skill.digest.clone()),
-                    legacy_path: None,
-                },
-            )
-        }));
-        let next = InstalledState {
-            version: INSTALLED_STATE_VERSION,
-            skills: next_skills,
+            BTreeSet::new()
         };
-        write_json_atomic_compact(&paths.state_path, &next)?;
-        if let InstallScope::Project(project_root) = &scope {
-            update_gitignore(project_root, &next)?;
+        let mut complete_names = selection.complete_names;
+        if !eligible.is_empty() || !removed.is_empty() {
+            changed = true;
+            let mut journal = TransactionJournal {
+                v: 1,
+                scope: if scope.is_global() { "g" } else { "p" }.to_owned(),
+                phase: TransactionPhase::P,
+                config: manifest_fingerprint(&active_manifest)?,
+                desired: desired_names.iter().cloned().collect(),
+                remove: removed.iter().cloned().collect(),
+            };
+            if effective_recovering {
+                write_json_atomic_compact(&paths.transaction_path, &journal)?;
+            } else {
+                write_json_exclusive_compact(&paths.transaction_path, &journal)?;
+            }
+            safe_remove_owned_dir(&stable_prepared_root, &paths.work_root)?;
+            std::fs::rename(&prepared_root, &stable_prepared_root).with_context(|| {
+                format!(
+                    "promoting prepared installation source to {}",
+                    stable_prepared_root.display()
+                )
+            })?;
+            let batch_error = run_vercel_install(
+                &paths.command_root,
+                &stable_prepared_root,
+                &eligible,
+                &manifest.agents,
+                scope.is_global(),
+            )
+            .err()
+            .map(|error| format!("{error:#}"));
+            journal.phase = TransactionPhase::I;
+            write_json_atomic_compact(&paths.transaction_path, &journal)?;
+            let (verified, verification_issues) = verified_skill_names(
+                &paths.command_root,
+                scope.is_global(),
+                &eligible,
+                &manifest.agents,
+                &stable_prepared_root,
+            );
+            complete_names.extend(verified);
+            let transaction_complete = verification_issues.is_empty();
+            if transaction_complete {
+                run_vercel_remove(
+                    &paths.command_root,
+                    &removed.iter().cloned().collect::<Vec<_>>(),
+                    scope.is_global(),
+                )?;
+                journal.phase = TransactionPhase::C;
+                write_json_atomic_compact(&paths.transaction_path, &journal)?;
+            }
+            let mut issues = selection.blocked;
+            issues.extend(verification_issues);
+            if let Some(error) = batch_error
+                && eligible
+                    .iter()
+                    .any(|skill| !complete_names.contains(&skill.installed_name))
+            {
+                issues.push(error);
+            }
+
+            let next = checkpoint_state(&previous, &resolved, &complete_names, &removed);
+            write_json_atomic_compact(&paths.state_path, &next)?;
+            if let InstallScope::Project(project_root) = &scope {
+                update_gitignore(project_root, &next)?;
+            }
+            if transaction_complete {
+                remove_transaction(&paths.transaction_path)?;
+            }
+            return Ok(issues);
         }
-        remove_transaction(&paths.transaction_path)?;
-        Ok(())
+
+        let next = checkpoint_state(&previous, &resolved, &complete_names, &BTreeSet::new());
+        if next != previous {
+            changed = true;
+            write_json_atomic_compact(&paths.state_path, &next)?;
+            if let InstallScope::Project(project_root) = &scope {
+                update_gitignore(project_root, &next)?;
+            }
+        }
+        if effective_recovering && selection.blocked.is_empty() {
+            remove_transaction(&paths.transaction_path)?;
+        }
+        Ok(selection.blocked)
     })();
 
-    let staging_cleanup = safe_remove_owned_dir(&staging_root, &paths.work_root);
     let prepared_cleanup = safe_remove_owned_dir(&prepared_root, &paths.work_root);
     let stable_prepared_cleanup = safe_remove_owned_dir(&stable_prepared_root, &paths.work_root);
-    result?;
-    staging_cleanup?;
+    let issues = result?;
     prepared_cleanup?;
     stable_prepared_cleanup?;
+    if !issues.is_empty() {
+        println!("install made maximal safe progress; Doctor summary:");
+        for issue in &issues {
+            println!("- {issue}");
+        }
+        bail!("install remains incomplete for {} item(s)", issues.len());
+    }
 
     let manual_count = resolved
         .iter()
@@ -332,8 +433,21 @@ pub(crate) fn install_with_catalogs_recovery(
         .iter()
         .filter(|skill| skill.mode == EffectiveMode::Dependency)
         .count();
+    if !changed {
+        println!(
+            "{} managed {} skill{} already converged",
+            resolved.len(),
+            if scope.is_global() {
+                "global"
+            } else {
+                "project"
+            },
+            if resolved.len() == 1 { "" } else { "s" }
+        );
+        return Ok(());
+    }
     println!(
-        "installed {} managed {} skill{} through Vercel Skills",
+        "reconciled {} managed {} skill{} through Vercel Skills",
         resolved.len(),
         if scope.is_global() {
             "global"
@@ -353,6 +467,58 @@ pub(crate) fn install_with_catalogs_recovery(
         );
     }
     Ok(())
+}
+
+fn writable_ancestor_probe(path: &Path, label: &str) -> Result<()> {
+    let mut ancestor = path;
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .with_context(|| format!("{label} has no existing writable ancestor"))?;
+    }
+    let metadata = std::fs::symlink_metadata(ancestor)
+        .with_context(|| format!("inspecting {label} at {}", ancestor.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "{label} writable ancestor is not a real directory: {}",
+            ancestor.display()
+        );
+    }
+    let probe = ancestor.join(format!(".skiller-write-probe-{}", std::process::id()));
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|file| file.sync_all());
+    let cleanup = std::fs::remove_file(&probe);
+    result.with_context(|| format!("{label} is not writable at {}", ancestor.display()))?;
+    cleanup.with_context(|| format!("removing {label} writability probe"))?;
+    Ok(())
+}
+
+fn preflight_environment(paths: &InstallPaths, global_scope: bool) -> Result<Vec<String>> {
+    let npm_cache = cache_root()?.join("npm");
+    let canonical_projection = projection_roots(&paths.command_root, global_scope)
+        .into_iter()
+        .next()
+        .context("canonical projection root is missing")?;
+    let state_parent = paths
+        .state_path
+        .parent()
+        .context("state path has no parent")?;
+    let targets = [
+        (state_parent, "state"),
+        (paths.work_root.as_path(), "work"),
+        (npm_cache.as_path(), "npm cache"),
+        (canonical_projection.as_path(), "canonical projection"),
+    ];
+    let mut issues = Vec::new();
+    for (path, label) in targets {
+        if let Err(error) = writable_ancestor_probe(path, label) {
+            issues.push(format!("{error:#}"));
+        }
+    }
+    Ok(issues)
 }
 
 pub(crate) fn install_paths(scope: &InstallScope) -> Result<InstallPaths> {
@@ -534,60 +700,20 @@ fn split_key(key: &str) -> Result<(&str, &str)> {
         .with_context(|| format!("invalid catalog skill identifier: {key}"))
 }
 
-fn prepare_skills(
-    resolved: &[ResolvedSkill<'_>],
-    staging_root: &Path,
-    prepared_root: &Path,
-) -> Result<()> {
-    let mut by_catalog = BTreeMap::<String, Vec<&ResolvedSkill<'_>>>::new();
+fn prepare_skills(resolved: &[ResolvedSkill<'_>], prepared_root: &Path) -> Result<()> {
     for skill in resolved {
-        by_catalog
-            .entry(skill.catalog.alias.clone())
-            .or_default()
-            .push(skill);
-    }
-    for (alias, skills) in by_catalog {
-        let catalog = skills[0].catalog;
-        let stage = staging_root.join(&alias);
-        ensure_real_dir(&stage)?;
-        run_vercel_stage(&stage, catalog, &skills)?;
-        for skill in skills {
-            let source = stage.join(".agents/skills").join(&skill.source_name);
-            if !source.join("SKILL.md").is_file() {
-                bail!(
-                    "Vercel Skills did not stage expected skill {} from {}",
-                    skill.source_name,
-                    catalog.source
-                );
-            }
-            let destination = prepared_root.join("skills").join(&skill.installed_name);
-            copy_tree(&source, &destination)?;
-            apply_projected_identity(
-                &destination,
-                &skill.installed_name,
-                skill.catalog.skills[&skill.source_name].scope.as_deref(),
-                &skill.catalog.skills[&skill.source_name].description,
-            )?;
-            apply_invocation_mode(&destination, skill.mode)?;
-        }
+        let source = skill.catalog.root.join("skills").join(&skill.source_name);
+        let destination = prepared_root.join("skills").join(&skill.installed_name);
+        copy_tree(&source, &destination)?;
+        apply_projected_identity(
+            &destination,
+            &skill.installed_name,
+            skill.catalog.skills[&skill.source_name].scope.as_deref(),
+            &skill.catalog.skills[&skill.source_name].description,
+        )?;
+        apply_invocation_mode(&destination, skill.mode)?;
     }
     Ok(())
-}
-
-fn run_vercel_stage(
-    stage: &Path,
-    catalog: &CatalogIndex,
-    skills: &[&ResolvedSkill<'_>],
-) -> Result<()> {
-    let mut command = vercel_command();
-    command.arg("add").arg(&catalog.root);
-    for skill in skills {
-        command.args(["--skill", &skill.source_name]);
-    }
-    command
-        .args(["--agent", "universal", "--copy", "--yes"])
-        .current_dir(stage);
-    run_command(command, &format!("staging catalog {}", catalog.alias))
 }
 
 fn run_vercel_install(
@@ -667,6 +793,9 @@ fn vercel_command() -> Command {
         .args(["--yes", VERCEL_SKILLS_PACKAGE])
         .env("npm_config_ignore_scripts", "true")
         .env("NO_COLOR", "1");
+    if let Ok(root) = cache_root() {
+        command.env("npm_config_cache", root.join("npm"));
+    }
     command
 }
 
@@ -695,16 +824,44 @@ pub(crate) fn remove_transaction(path: &Path) -> Result<()> {
     }
 }
 
+fn bounded_environment_error(error: anyhow::Error) -> anyhow::Error {
+    let detail = format!("{error:#}");
+    let class = if detail.contains("exceeded") {
+        "environment-timeout"
+    } else {
+        "environment-process"
+    };
+    anyhow::anyhow!("[{class}] {detail}")
+}
+
+fn child_failure(action: &str, stdout: &[u8], stderr: &[u8]) -> anyhow::Error {
+    let detail = format!(
+        "{}{}",
+        sanitize_child_output(stdout),
+        sanitize_child_output(stderr)
+    );
+    let lower = detail.to_ascii_lowercase();
+    let class = if ["eacces", "eperm", "permission denied", "sandbox"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        "environment-permission"
+    } else if ["enotfound", "econn", "network", "fetch failed", "timed out"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        "environment-network"
+    } else {
+        "placement"
+    };
+    anyhow::anyhow!("[{class}] Vercel Skills failed while {action}: {detail}")
+}
+
 fn run_command(mut command: Command, action: &str) -> Result<()> {
-    let output = command
-        .output()
-        .with_context(|| format!("starting npx {VERCEL_SKILLS_PACKAGE} while {action}"))?;
-    if !output.status.success() {
-        bail!(
-            "Vercel Skills failed while {action}: {}{}",
-            sanitize_child_output(&output.stdout),
-            sanitize_child_output(&output.stderr)
-        );
+    let (status, stdout, stderr) = output_bounded(&mut command, action, Duration::from_secs(60))
+        .map_err(bounded_environment_error)?;
+    if !status.success() {
+        return Err(child_failure(action, &stdout, &stderr));
     }
     Ok(())
 }
@@ -740,93 +897,227 @@ pub(crate) fn projection_roots(command_root: &Path, global_scope: bool) -> Vec<P
         .collect()
 }
 
-fn refuse_unowned_conflicts(
+fn checkpoint_state(
+    previous: &InstalledState,
+    resolved: &[ResolvedSkill<'_>],
+    complete_names: &BTreeSet<String>,
+    removed_names: &BTreeSet<String>,
+) -> InstalledState {
+    let mut skills = previous.skills.clone();
+    skills.retain(|_, skill| !removed_names.contains(&skill.installed_name));
+    for skill in resolved {
+        if !complete_names.contains(&skill.installed_name) {
+            continue;
+        }
+        skills.retain(|key, installed| {
+            key == &skill.key || installed.installed_name != skill.installed_name
+        });
+        skills.insert(
+            skill.key.clone(),
+            InstalledSkill {
+                installed_name: skill.installed_name.clone(),
+                mode: skill.mode,
+                gitignore: skill.gitignore,
+                digest: Some(skill.digest.clone()),
+                legacy_path: None,
+            },
+        );
+    }
+    InstalledState {
+        version: INSTALLED_STATE_VERSION,
+        skills,
+    }
+}
+
+fn exact_projection_matches(actual: &Path, intended: &Path) -> Result<bool> {
+    let actual = match std::fs::canonicalize(actual) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("resolving {}", actual.display())),
+    };
+    if !actual.is_dir() || !intended.is_dir() {
+        return Ok(false);
+    }
+    Ok(directory_digest(&actual)? == directory_digest(intended)?)
+}
+
+fn classify_reconciliation(
     command_root: &Path,
     global_scope: bool,
     previous: &InstalledState,
     resolved: &[ResolvedSkill<'_>],
     recovery_owned: &BTreeSet<String>,
     agents: &[String],
-) -> Result<()> {
+    prepared_root: &Path,
+) -> Result<ReconcileSelection> {
     let mut owned: BTreeSet<_> = previous
         .skills
         .values()
-        .map(|skill| skill.installed_name.as_str())
+        .map(|skill| skill.installed_name.clone())
         .collect();
-    owned.extend(recovery_owned.iter().map(String::as_str));
+    owned.extend(recovery_owned.iter().cloned());
     let roots = projection_roots(command_root, global_scope);
     let agent_names: Vec<_> = agents
         .iter()
         .map(|agent| list_agent_skill_names(command_root, global_scope, agent))
         .collect::<Result<_>>()?;
+    let mut selection = ReconcileSelection {
+        install_names: BTreeSet::new(),
+        complete_names: BTreeSet::new(),
+        blocked: Vec::new(),
+    };
     for skill in resolved {
-        let conflict = roots
+        let intended = prepared_root.join("skills").join(&skill.installed_name);
+        let existing: Vec<_> = roots
             .iter()
             .map(|root| root.join(&skill.installed_name))
-            .any(|path| path.exists() || path.is_symlink())
-            || agent_names
-                .iter()
-                .any(|names| names.contains(&skill.installed_name));
-        if conflict && !owned.contains(skill.installed_name.as_str()) {
-            bail!(
-                "refusing to replace a skill not owned by Skiller: {}",
-                skill.installed_name
-            );
-        }
-    }
-    Ok(())
-}
-
-fn retry_missing_installations(
-    command_root: &Path,
-    prepared_root: &Path,
-    global_scope: bool,
-    resolved: &[ResolvedSkill<'_>],
-    agents: &[String],
-) -> Result<()> {
-    let mut missing = BTreeSet::new();
-    for agent in agents {
-        let installed = list_agent_skill_names(command_root, global_scope, agent)?;
-        for skill in resolved {
-            if !installed.contains(&skill.installed_name) {
-                missing.insert(skill.installed_name.as_str());
-            }
-        }
-    }
-    for name in missing {
-        let skill = resolved
+            .filter(|path| path.exists() || path.is_symlink())
+            .collect();
+        let all_agents_have = agent_names
             .iter()
-            .find(|skill| skill.installed_name == name)
-            .context("missing installation has no resolved skill")?;
-        run_vercel_install(
-            command_root,
-            prepared_root,
-            std::slice::from_ref(skill),
-            agents,
-            global_scope,
-        )?;
+            .all(|names| names.contains(&skill.installed_name));
+        let all_existing_match = existing
+            .iter()
+            .map(|path| exact_projection_matches(path, &intended))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .all(|matches| matches);
+        let state_current = previous.skills.get(&skill.key).is_some_and(|installed| {
+            installed.installed_name == skill.installed_name
+                && installed.mode == skill.mode
+                && installed.gitignore == skill.gitignore
+                && installed.digest.as_deref() == Some(&skill.digest)
+        });
+        if owned.contains(&skill.installed_name) {
+            if state_current && all_agents_have && !existing.is_empty() && all_existing_match {
+                selection
+                    .complete_names
+                    .insert(skill.installed_name.clone());
+            } else {
+                selection.install_names.insert(skill.installed_name.clone());
+            }
+        } else if existing.is_empty()
+            && !agent_names
+                .iter()
+                .any(|names| names.contains(&skill.installed_name))
+        {
+            selection.install_names.insert(skill.installed_name.clone());
+        } else if all_existing_match && !existing.is_empty() {
+            if all_agents_have {
+                selection
+                    .complete_names
+                    .insert(skill.installed_name.clone());
+            } else {
+                selection.install_names.insert(skill.installed_name.clone());
+            }
+        } else {
+            selection.blocked.push(format!(
+                "[unowned-conflict] {} has divergent or unverifiable unowned projections",
+                skill.key
+            ));
+        }
     }
-    Ok(())
+
+    let mut blocked_names: BTreeSet<_> = selection
+        .blocked
+        .iter()
+        .filter_map(|message| resolved.iter().find(|skill| message.contains(&skill.key)))
+        .map(|skill| skill.source_name.clone())
+        .collect();
+    loop {
+        let mut changed = false;
+        for skill in resolved {
+            if blocked_names.contains(&skill.source_name) {
+                continue;
+            }
+            if skill.catalog.skills[&skill.source_name]
+                .requires
+                .iter()
+                .any(|dependency| blocked_names.contains(dependency))
+            {
+                blocked_names.insert(skill.source_name.clone());
+                selection.install_names.remove(&skill.installed_name);
+                selection.complete_names.remove(&skill.installed_name);
+                selection.blocked.push(format!(
+                    "[dependency-blocked] {} depends on a blocked skill",
+                    skill.key
+                ));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(selection)
 }
 
-fn verify_installation(
+fn verified_skill_names(
     command_root: &Path,
     global_scope: bool,
     resolved: &[ResolvedSkill<'_>],
     agents: &[String],
-) -> Result<()> {
-    for agent in agents {
-        let installed = list_agent_skill_names(command_root, global_scope, agent)?;
-        for skill in resolved {
-            if !installed.contains(&skill.installed_name) {
-                bail!(
-                    "Vercel Skills did not install {} for agent {agent}",
-                    skill.installed_name
-                );
-            }
+    prepared_root: &Path,
+) -> (BTreeSet<String>, Vec<String>) {
+    let snapshots: Result<Vec<_>> = agents
+        .iter()
+        .map(|agent| list_agent_skill_names(command_root, global_scope, agent))
+        .collect();
+    let snapshots = match snapshots {
+        Ok(snapshots) => snapshots,
+        Err(error) => return (BTreeSet::new(), vec![format!("[environment] {error:#}")]),
+    };
+    let canonical_root = projection_roots(command_root, global_scope)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| command_root.join(".agents/skills"));
+    let mut verified = BTreeSet::new();
+    let mut issues = Vec::new();
+    for skill in resolved {
+        let listed = snapshots
+            .iter()
+            .all(|names| names.contains(&skill.installed_name));
+        let actual = canonical_root.join(&skill.installed_name);
+        let intended = prepared_root.join("skills").join(&skill.installed_name);
+        let content_matches = exact_projection_matches(&actual, &intended).unwrap_or(false);
+        if listed && content_matches {
+            verified.insert(skill.installed_name.clone());
+        } else {
+            issues.push(format!(
+                "[projection-drift] {} was not completely placed and verified",
+                skill.key
+            ));
         }
     }
-    Ok(())
+    (verified, issues)
+}
+
+fn known_agent_projection_root(
+    command_root: &Path,
+    _global_scope: bool,
+    agent: &str,
+) -> Option<PathBuf> {
+    let relative = match agent {
+        "universal" | "claude-code" | "pi" => ".agents/skills",
+        _ => return None,
+    };
+    Some(command_root.join(relative))
+}
+
+fn directory_skill_names(root: &Path) -> Result<BTreeSet<String>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", root.display())),
+    };
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("listing {}", root.display()))?;
+        if entry.path().is_dir() {
+            names.insert(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(names)
 }
 
 pub(crate) fn list_agent_skill_names(
@@ -834,23 +1125,29 @@ pub(crate) fn list_agent_skill_names(
     global_scope: bool,
     agent: &str,
 ) -> Result<BTreeSet<String>> {
+    if let Some(root) = known_agent_projection_root(command_root, global_scope, agent) {
+        return directory_skill_names(&root);
+    }
     let mut command = vercel_command();
     command.args(["list", "--json", "--agent", agent]);
     if global_scope {
         command.arg("--global");
     }
     command.current_dir(command_root);
-    let output = command
-        .output()
-        .with_context(|| format!("listing Vercel Skills for agent {agent}"))?;
-    if !output.status.success() {
-        bail!(
-            "Vercel Skills rejected agent {agent}: {}{}",
-            sanitize_child_output(&output.stdout),
-            sanitize_child_output(&output.stderr)
-        );
+    let (status, stdout, stderr) = output_bounded(
+        &mut command,
+        &format!("listing skills for agent {agent}"),
+        Duration::from_secs(15),
+    )
+    .map_err(bounded_environment_error)?;
+    if !status.success() {
+        return Err(child_failure(
+            &format!("listing skills for agent {agent}"),
+            &stdout,
+            &stderr,
+        ));
     }
-    let rows: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&stdout)
         .with_context(|| format!("parsing Vercel Skills list for agent {agent}"))?;
     Ok(rows
         .into_iter()
@@ -1069,6 +1366,26 @@ mod tests {
             r#"{"v":1,"scope":"g","phase":"v","config":"abc","desired":["learn-learning"],"remove":["digest-knowledge"]}"#
         );
         assert!(TransactionPhase::I < TransactionPhase::V);
+    }
+
+    #[test]
+    fn exact_projection_comparison_adopts_only_identical_trees() {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/exact-projection");
+        let _ = std::fs::remove_dir_all(&base);
+        let actual = base.join("actual");
+        let intended = base.join("intended");
+        std::fs::create_dir_all(actual.join("references")).unwrap();
+        std::fs::create_dir_all(intended.join("references")).unwrap();
+        std::fs::write(actual.join("SKILL.md"), "same").unwrap();
+        std::fs::write(intended.join("SKILL.md"), "same").unwrap();
+        std::fs::write(actual.join("references/data.json"), "{}").unwrap();
+        std::fs::write(intended.join("references/data.json"), "{}").unwrap();
+        assert!(exact_projection_matches(&actual, &intended).unwrap());
+        std::fs::write(actual.join("references/data.json"), "{\"drift\":true}").unwrap();
+        assert!(!exact_projection_matches(&actual, &intended).unwrap());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

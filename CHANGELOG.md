@@ -1,3 +1,17 @@
+## [0.9.0] - 2026-08-25
+
+### Features
+
+- Make `install` a convergent reconciliation: apply declared renames inline, adopt byte-identical unowned projections, continue independent skills, and report every residual blocker.
+- Resume validated interrupted installations directly from `install` and checkpoint only fully verified skill outcomes.
+- Expose catalog authoring provenance through existing configuration reports and mark every installed skill directory as a read-only projection.
+
+### Security
+
+- Preflight managed state, work, npm-cache, and canonical projection writability before placement.
+- Bound Vercel Skills listing and placement subprocesses and classify permission, sandbox, network, timeout, placement, and state failures separately.
+- Bound noninteractive SSH catalog connection attempts and suppress repeated retries of the same unreachable source for 60 seconds.
+
 ## [0.8.2] - 2026-08-21
 
 ### Changed

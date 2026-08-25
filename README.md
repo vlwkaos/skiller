@@ -20,7 +20,7 @@ skiller migrate --plan migration.json --check
 skiller migrate --plan migration.json --apply [--yes]
 ```
 
-`catalog configure` registers or updates canonical source, ref, and optional explicit owner checkout. Local source and authoring paths may start with `~/` for portable dotfiles configuration. `config` edits desired selection. `update --check` reports published and unpublished authoring differences without installation. `update` requires confirmation and installs canonical catalog content. `install` performs full canonical reconciliation. `doctor` diagnoses and explicitly repairs owned state. `migrate` guides legacy skills into a writable catalog, creates configuration, and optionally installs and cleans exact approved legacy names.
+`catalog configure` registers or updates canonical source, ref, and optional explicit owner checkout. Local source and authoring paths may start with `~/` for portable dotfiles configuration. `config` edits desired selection. `config --print` also reports machine-local authoring provenance and whether it is the canonical source. `update --check` reports published and unpublished authoring differences without installation. `update` requires confirmation and installs canonical catalog content. `install` performs full canonical reconciliation, including safe rename repair, exact-content adoption, independent progress, and inline owned recovery. `doctor` diagnoses and explicitly repairs owned state. `migrate` guides legacy skills into a writable catalog, creates configuration, and optionally installs and cleans exact approved legacy names.
 
 ## Configuration
 
@@ -79,6 +79,8 @@ Dependencies use comma-separated `metadata.skiller.requires`. Missing dependenci
 - Skiller removes only prior ownership or exact validated migration/recovery names.
 - Installed state is compact schema 3 under the XDG state directory and records deterministic projected-content digests.
 - Catalog checks may refresh caches but never install; updates remain confirmation-gated. Unreachable sources are warned once and skipped for that reconciliation; a readable prior cache is shown as read-only stale metadata. `config --print`, `update --check --json`, and `doctor --print` expose a camelCase `catalogStatus` array with alias, availability/stale state, declared and installed counts, and a sanitized warning.
-- Interrupted installation retains an owned transaction journal for Doctor recovery.
+- Installed skill directories are read-only projections. Skills write only to explicit project, XDG state/cache, or catalog authoring paths; Skiller remains the projection writer.
+- Interrupted installation retains an owned transaction journal that a later `install` resumes when its scope and desired names still validate.
+- Vercel listing is bounded to 15 seconds and placement to 60 seconds. Permission, sandbox, network, timeout, placement, and state failures are reported separately without speculative ownership advice.
 
 The guided migration procedure is also available as `skills/skiller-migrate/SKILL.md` in this repository.

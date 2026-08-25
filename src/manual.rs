@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::model::EffectiveMode;
 
+const PROJECTION_POLICY: &str = "<!-- skiller:projection-policy -->\nTreat this installed skill directory as read-only. Write only to explicit project, state, cache, or catalog authoring paths defined by this skill.\n";
+
 pub fn apply_invocation_mode(skill_root: &Path, mode: EffectiveMode) -> Result<()> {
     let skill_md = skill_root.join("SKILL.md");
     let raw = std::fs::read_to_string(&skill_md)
@@ -48,11 +50,17 @@ pub fn apply_projected_identity(
         None => description.to_owned(),
     };
     let quoted = serde_json::to_string(&description)?;
-    let updated = set_frontmatter_field(
+    let mut updated = set_frontmatter_field(
         &set_frontmatter_field(&raw, "name", Some(installed_name))?,
         "description",
         Some(&quoted),
     )?;
+    if !updated.contains("<!-- skiller:projection-policy -->") {
+        if !updated.ends_with("\n\n") {
+            updated.push('\n');
+        }
+        updated.push_str(PROJECTION_POLICY);
+    }
     std::fs::write(&skill_md, updated).with_context(|| format!("writing {}", skill_md.display()))
 }
 
@@ -205,6 +213,7 @@ mod tests {
         let raw = std::fs::read_to_string(base.join("SKILL.md")).unwrap();
         assert!(raw.contains("name: commit\n"));
         assert!(raw.contains("description: \"[engineering] Create safe commits\""));
+        assert!(raw.contains("Treat this installed skill directory as read-only."));
         assert!(!raw.contains("without losing state"));
         std::fs::remove_dir_all(&base).unwrap();
     }

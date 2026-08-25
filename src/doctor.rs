@@ -452,7 +452,7 @@ fn load_inputs(scope: &InstallScope) -> Result<Inputs> {
     })
 }
 
-fn migrate_declared_renames(
+pub(crate) fn migrate_declared_renames(
     manifest: &ProjectConfig,
     catalogs: &BTreeMap<String, CatalogIndex>,
     global_scope: bool,
@@ -519,8 +519,8 @@ fn validate_transaction(
         .collect();
     validate_name_list("desired", &journal.desired)?;
     validate_name_list("remove", &journal.remove)?;
-    if journal.desired != desired.iter().cloned().collect::<Vec<_>>() {
-        bail!("transaction desired names do not match current resolution");
+    if journal.desired.iter().any(|name| !desired.contains(name)) {
+        bail!("transaction desired names are not a safe subset of current resolution");
     }
     if journal.remove.iter().any(|name| desired.contains(name)) {
         bail!("transaction cannot both desire and remove the same name");

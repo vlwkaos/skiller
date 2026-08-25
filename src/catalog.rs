@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -9,9 +10,9 @@ use crate::model::{
     validate_alias, validate_schema,
 };
 use crate::paths::{
-    cache_root, copy_tree, ensure_real_dir, expand_home_path, global_config_path, read_json,
-    read_json_or_default, safe_remove_owned_dir, sanitize_child_output, write_global_config,
-    write_json_atomic,
+    cache_root, copy_tree, ensure_real_dir, expand_home_path, global_config_path, output_bounded,
+    read_json, read_json_or_default, safe_remove_owned_dir, sanitize_child_output,
+    write_global_config, write_json_atomic,
 };
 
 #[derive(Debug, Clone)]
@@ -513,6 +514,15 @@ fn clone_catalog(
 ) -> Result<PathBuf> {
     let catalogs_root = cache_root()?.join("catalogs");
     crate::paths::ensure_real_dir(&catalogs_root)?;
+    let failure_marker = catalogs_root.join(format!(".{alias}-unavailable"));
+    if noninteractive
+        && std::fs::metadata(&failure_marker)
+            .and_then(|metadata| metadata.modified())
+            .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+            .is_ok_and(|elapsed| elapsed < std::time::Duration::from_secs(60))
+    {
+        bail!("recent catalog source failure; retry deferred for up to 60 seconds");
+    }
     // Preserve the last good clone until this refresh has succeeded.
     let staging = catalogs_root.join(format!(".{alias}-refresh-{}", std::process::id()));
     safe_remove_owned_dir(&staging, &catalogs_root)?;
@@ -533,15 +543,16 @@ fn clone_catalog(
         if noninteractive {
             command.env("GIT_TERMINAL_PROMPT", "0").env(
                 "GIT_SSH_COMMAND",
-                "ssh -o BatchMode=yes -o ConnectTimeout=5",
+                "ssh -o BatchMode=yes -o ConnectionAttempts=1 -o ConnectTimeout=2",
             );
         }
-        let output = command
-            .arg(&candidate)
-            .arg(&staging)
-            .output()
-            .with_context(|| format!("starting git clone for {}", registration.source))?;
-        if output.status.success() {
+        command.arg(&candidate).arg(&staging);
+        let (status, stdout, stderr) = output_bounded(
+            &mut command,
+            &format!("cloning catalog {}", registration.source),
+            Duration::from_secs(15),
+        )?;
+        if status.success() {
             if commit_ref {
                 let reference = registration.r#ref.as_deref().expect("commit ref exists");
                 let mut fetch = Command::new("git");
@@ -551,29 +562,44 @@ fn clone_catalog(
                 if noninteractive {
                     fetch.env("GIT_TERMINAL_PROMPT", "0").env(
                         "GIT_SSH_COMMAND",
-                        "ssh -o BatchMode=yes -o ConnectTimeout=5",
+                        "ssh -o BatchMode=yes -o ConnectionAttempts=1 -o ConnectTimeout=2",
                     );
                 }
-                let fetched = fetch.output()?;
-                let checked_out = fetched.status.success()
-                    && Command::new("git")
-                        .args(["checkout", "--detach", "FETCH_HEAD"])
-                        .current_dir(&staging)
-                        .output()?
-                        .status
-                        .success();
-                if !checked_out {
-                    failures.push(sanitize_child_output(&fetched.stderr));
+                let (fetched_status, _, fetched_stderr) = output_bounded(
+                    &mut fetch,
+                    "fetching catalog commit",
+                    Duration::from_secs(15),
+                )?;
+                let mut checkout = Command::new("git");
+                checkout
+                    .args(["checkout", "--detach", "FETCH_HEAD"])
+                    .current_dir(&staging);
+                let checkout_status = output_bounded(
+                    &mut checkout,
+                    "checking out catalog commit",
+                    Duration::from_secs(10),
+                )?
+                .0;
+                if !fetched_status.success() || !checkout_status.success() {
+                    failures.push(sanitize_child_output(&fetched_stderr));
                     safe_remove_owned_dir(&staging, &catalogs_root)?;
                     continue;
                 }
             }
+            let _ = std::fs::remove_file(&failure_marker);
             return staging
                 .canonicalize()
                 .with_context(|| format!("resolving cloned catalog {alias}"));
         }
-        failures.push(sanitize_child_output(&output.stderr));
+        failures.push(format!(
+            "{}{}",
+            sanitize_child_output(&stdout),
+            sanitize_child_output(&stderr)
+        ));
         safe_remove_owned_dir(&staging, &catalogs_root)?;
+    }
+    if noninteractive {
+        let _ = std::fs::write(&failure_marker, b"1\n");
     }
     bail!(
         "failed to clone catalog {}: {}",
@@ -724,7 +750,7 @@ fn git_revision(root: &Path) -> Result<Option<String>> {
     Ok((!revision.is_empty()).then_some(revision))
 }
 
-fn directory_digest(root: &Path) -> Result<String> {
+pub(crate) fn directory_digest(root: &Path) -> Result<String> {
     fn update(hash: &mut u64, bytes: &[u8]) {
         for byte in bytes {
             *hash ^= u64::from(*byte);

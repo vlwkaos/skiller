@@ -15,8 +15,8 @@ use crate::model::{
     validate_installed_state, validate_schema,
 };
 use crate::paths::{
-    global_config_path, global_state_path, read_json_or_default, write_global_config,
-    write_json_atomic,
+    expand_home_path, global_config_path, global_state_path, read_json_or_default,
+    write_global_config, write_json_atomic,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,6 +59,9 @@ struct PrintedCatalogStatus {
     installed_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authoring_path: Option<String>,
+    authoring_is_canonical: bool,
 }
 
 pub fn configure(
@@ -133,7 +136,12 @@ pub fn configure(
             config_path: config_path.display().to_string(),
             agents: &manifest.agents,
             skills: &rows,
-            catalog_status: printed_catalog_statuses(&sync.statuses, &manifest, &state),
+            catalog_status: printed_catalog_statuses(
+                &sync.statuses,
+                &manifest,
+                &state,
+                &global_config.catalogs,
+            ),
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(());
@@ -256,6 +264,7 @@ fn printed_catalog_statuses(
     statuses: &BTreeMap<String, CatalogStatus>,
     manifest: &ProjectConfig,
     state: &InstalledState,
+    registrations: &BTreeMap<String, crate::model::CatalogRegistration>,
 ) -> Vec<PrintedCatalogStatus> {
     statuses
         .values()
@@ -278,6 +287,25 @@ fn printed_catalog_statuses(
                 .filter(|key| key.starts_with(&format!("{}/", status.alias)))
                 .count(),
             warning: status.warning.clone(),
+            authoring_path: registrations.get(&status.alias).and_then(|registration| {
+                let configured = registration.authoring_root.as_deref().unwrap_or(&registration.source);
+                (registration.authoring_root.is_some() || registration.r#ref.is_none())
+                    .then(|| expand_home_path(configured).ok())
+                    .flatten()
+                    .filter(|path| path.is_dir())
+                    .map(|path| path.display().to_string())
+            }),
+            authoring_is_canonical: registrations.get(&status.alias).is_some_and(|registration| {
+                if registration.r#ref.is_some() {
+                    return false;
+                }
+                let authoring = registration.authoring_root.as_deref().unwrap_or(&registration.source);
+                let source = expand_home_path(&registration.source)
+                    .and_then(|path| path.canonicalize().context("resolving source"));
+                let authoring = expand_home_path(authoring)
+                    .and_then(|path| path.canonicalize().context("resolving authoring root"));
+                matches!((source, authoring), (Ok(source), Ok(authoring)) if source == authoring)
+            }),
         })
         .collect()
 }
@@ -560,6 +588,7 @@ mod tests {
             &BTreeMap::from([("offline".to_owned(), status)]),
             &manifest,
             &state,
+            &BTreeMap::new(),
         );
         assert_eq!(report[0].availability, "unavailable");
         assert_eq!(

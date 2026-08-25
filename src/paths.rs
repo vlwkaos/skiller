@@ -1,14 +1,58 @@
 use std::env;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub fn output_bounded(
+    command: &mut Command,
+    action: &str,
+    timeout: Duration,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("starting subprocess while {action}"))?;
+    let mut stdout = child.stdout.take().context("capturing subprocess stdout")?;
+    let mut stderr = child.stderr.take().context("capturing subprocess stderr")?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().context("checking subprocess status")? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(stdout_reader);
+            drop(stderr_reader);
+            bail!("subprocess exceeded {}s while {action}", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("subprocess stdout reader failed"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("subprocess stderr reader failed"))??;
+    Ok((status, stdout, stderr))
+}
 
 pub fn config_root() -> Result<PathBuf> {
     if let Some(path) = env::var_os("SKILLER_CONFIG_HOME") {
@@ -352,6 +396,18 @@ mod tests {
             "prepared"
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_output_stops_a_hung_subprocess() {
+        let mut command = Command::new("sleep");
+        command.arg("1");
+        let started = Instant::now();
+        assert!(
+            output_bounded(&mut command, "testing timeout", Duration::from_millis(20)).is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
