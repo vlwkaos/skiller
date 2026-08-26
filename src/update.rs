@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 
 use anyhow::{Context, Result, bail};
@@ -14,16 +14,6 @@ use crate::paths::{read_json, read_json_or_default};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CatalogVersion {
-    source: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    r#ref: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    revision: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 struct SkillUpdate {
     key: String,
     status: &'static str,
@@ -36,10 +26,10 @@ struct SkillUpdate {
 #[serde(rename_all = "camelCase")]
 struct UpdateReport {
     scope: &'static str,
-    catalogs: BTreeMap<String, CatalogVersion>,
-    catalog_status: Vec<UpdateCatalogStatus>,
     updates: Vec<SkillUpdate>,
-    local_drafts: Vec<SkillUpdate>,
+    drafts: Vec<SkillUpdate>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<UpdateCatalogStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,7 +48,7 @@ struct UpdateCatalogStatus {
     draft_warning: Option<String>,
 }
 
-pub fn run(scope: InstallScope, check: bool, json: bool, yes: bool) -> Result<()> {
+pub fn run(scope: InstallScope, machine: bool, yes: bool) -> Result<()> {
     let global = load_global_config()?;
     let sync = sync_registered_catalogs_resilient(&global)?;
     for status in sync
@@ -91,10 +81,8 @@ pub fn run(scope: InstallScope, check: bool, json: bool, yes: bool) -> Result<()
     let resolved = resolve_manifest(&active_manifest, &catalogs, scope.is_global())?;
     let paths = install_paths(&scope)?;
     let installed: InstalledState = read_json_or_default(&paths.state_path)?;
-    let mut used_catalogs = BTreeSet::new();
     let mut updates = Vec::new();
     for skill in &resolved {
-        used_catalogs.insert(skill.key.split_once('/').expect("resolved key has alias").0);
         if let Some(update) = skill_update(skill, installed.skills.get(&skill.key)) {
             updates.push(update);
         }
@@ -106,7 +94,7 @@ pub fn run(scope: InstallScope, check: bool, json: bool, yes: bool) -> Result<()
         .iter()
         .map(|skill| (skill.key.as_str(), skill.digest.as_str()))
         .collect();
-    let local_drafts = authoring
+    let drafts = authoring
         .iter()
         .filter(|skill| {
             global
@@ -122,22 +110,7 @@ pub fn run(scope: InstallScope, check: bool, json: bool, yes: bool) -> Result<()
             update
         })
         .collect();
-    let catalog_versions = used_catalogs
-        .into_iter()
-        .filter_map(|alias| {
-            let catalog = catalogs.get(alias)?;
-            let registration = global.catalogs.get(alias)?;
-            Some((
-                alias.to_owned(),
-                CatalogVersion {
-                    source: registration.source.clone(),
-                    r#ref: registration.r#ref.clone(),
-                    revision: catalog.revision.clone(),
-                },
-            ))
-        })
-        .collect();
-    let catalog_status = update_catalog_statuses(
+    let warnings = update_catalog_statuses(
         &sync.statuses,
         &global,
         &manifest,
@@ -150,14 +123,13 @@ pub fn run(scope: InstallScope, check: bool, json: bool, yes: bool) -> Result<()
         } else {
             "project"
         },
-        catalogs: catalog_versions,
-        catalog_status,
         updates,
-        local_drafts,
+        drafts,
+        warnings,
     };
-    if json {
+    if machine {
         println!("{}", serde_json::to_string(&report)?);
-    } else if report.updates.is_empty() && report.local_drafts.is_empty() {
+    } else if report.updates.is_empty() && report.drafts.is_empty() {
         println!("{} skills are current", report.scope);
     } else {
         if !report.updates.is_empty() {
@@ -170,22 +142,18 @@ pub fn run(scope: InstallScope, check: bool, json: bool, yes: bool) -> Result<()
                 println!("- {} ({})", update.key, update.status);
             }
         }
-        if !report.local_drafts.is_empty() {
+        if !report.drafts.is_empty() {
             println!(
                 "{} unpublished authoring change{} detected:",
-                report.local_drafts.len(),
-                if report.local_drafts.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
+                report.drafts.len(),
+                if report.drafts.len() == 1 { "" } else { "s" }
             );
-            for update in &report.local_drafts {
+            for update in &report.drafts {
                 println!("- {}", update.key);
             }
         }
     }
-    if check || report.updates.is_empty() {
+    if (machine && !yes) || report.updates.is_empty() {
         return Ok(());
     }
     if !yes && !confirm(report.updates.len())? {
@@ -210,6 +178,10 @@ fn update_catalog_statuses(
 ) -> Vec<UpdateCatalogStatus> {
     statuses
         .values()
+        .filter(|status| {
+            status.availability != CatalogAvailability::Available
+                || draft_warnings.contains_key(&status.alias)
+        })
         .map(|status| UpdateCatalogStatus {
             alias: status.alias.clone(),
             availability: match status.availability {
@@ -323,6 +295,7 @@ mod tests {
                     mode: EffectiveMode::Enable,
                     gitignore: false,
                     digest: None,
+                    content_digest: None,
                     legacy_path: None,
                 },
             )]),

@@ -1,3 +1,17 @@
+## [0.9.1] - 2026-08-26
+
+### Changed
+
+- Preserve locally modified project skills as tracked overrides; block catalog conflicts, dependent updates, removals, and renames without mutating project content.
+- Replace format flags with automatic TTY views and compact non-TTY JSON for config, Doctor, and update checks.
+- Reduce the CLI to catalog, config, doctor, update, and install; remove the compatibility catalog alias and built-in migration command.
+- Resolve catalog authoring by registered alias, unify project mode and Git-ignore state, and organize the configuration TUI around mode, sync status, details, and valid contextual actions.
+- Remove catalog revision subprocesses and keep config and Doctor cache-only for faster checks.
+
+### State
+
+- Advance installed state to schema 4 with an exact content baseline while retaining schema 1–3 reads.
+
 ## [0.9.0] - 2026-08-25
 
 ### Features

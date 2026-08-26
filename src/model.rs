@@ -4,8 +4,9 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub const INSTALLED_STATE_VERSION: u32 = 3;
-pub const PREVIOUS_INSTALLED_STATE_VERSION: u32 = 2;
+pub const INSTALLED_STATE_VERSION: u32 = 4;
+pub const PREVIOUS_INSTALLED_STATE_VERSION: u32 = 3;
+const LEGACY_COMPACT_STATE_VERSION: u32 = 2;
 
 pub fn default_agents() -> Vec<String> {
     ["universal", "claude-code", "pi"]
@@ -143,13 +144,14 @@ pub struct InstalledSkill {
     pub mode: EffectiveMode,
     pub gitignore: bool,
     pub digest: Option<String>,
+    pub content_digest: Option<String>,
     pub legacy_path: Option<String>,
 }
 
 #[derive(Serialize)]
 struct CompactInstalledState<'a> {
     v: u32,
-    skills: BTreeMap<&'a str, (&'a str, CompactMode, bool, &'a str)>,
+    skills: BTreeMap<&'a str, (&'a str, CompactMode, bool, &'a str, &'a str)>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -186,9 +188,14 @@ enum InstalledStateWire {
     CompactCurrent {
         v: u32,
         #[serde(default)]
-        skills: BTreeMap<String, (String, CompactMode, bool, String)>,
+        skills: BTreeMap<String, (String, CompactMode, bool, String, String)>,
     },
     CompactPrevious {
+        v: u32,
+        #[serde(default)]
+        skills: BTreeMap<String, (String, CompactMode, bool, String)>,
+    },
+    CompactLegacy {
         v: u32,
         #[serde(default)]
         skills: BTreeMap<String, (String, CompactMode, bool)>,
@@ -229,6 +236,7 @@ impl Serialize for InstalledState {
                         CompactMode::from(skill.mode),
                         skill.gitignore,
                         skill.digest.as_deref().unwrap_or(""),
+                        skill.content_digest.as_deref().unwrap_or(""),
                     ),
                 )
             })
@@ -258,6 +266,35 @@ impl<'de> Deserialize<'de> for InstalledState {
                     version: v,
                     skills: skills
                         .into_iter()
+                        .map(
+                            |(key, (installed_name, mode, gitignore, digest, content_digest))| {
+                                (
+                                    key,
+                                    InstalledSkill {
+                                        installed_name,
+                                        mode: mode.into(),
+                                        gitignore,
+                                        digest: (!digest.is_empty()).then_some(digest),
+                                        content_digest: (!content_digest.is_empty())
+                                            .then_some(content_digest),
+                                        legacy_path: None,
+                                    },
+                                )
+                            },
+                        )
+                        .collect(),
+                })
+            }
+            InstalledStateWire::CompactPrevious { v, skills } => {
+                if v != PREVIOUS_INSTALLED_STATE_VERSION {
+                    return Err(serde::de::Error::custom(format!(
+                        "unsupported installed state schema version {v}; expected {PREVIOUS_INSTALLED_STATE_VERSION}"
+                    )));
+                }
+                Ok(Self {
+                    version: v,
+                    skills: skills
+                        .into_iter()
                         .map(|(key, (installed_name, mode, gitignore, digest))| {
                             (
                                 key,
@@ -266,6 +303,7 @@ impl<'de> Deserialize<'de> for InstalledState {
                                     mode: mode.into(),
                                     gitignore,
                                     digest: (!digest.is_empty()).then_some(digest),
+                                    content_digest: None,
                                     legacy_path: None,
                                 },
                             )
@@ -273,10 +311,10 @@ impl<'de> Deserialize<'de> for InstalledState {
                         .collect(),
                 })
             }
-            InstalledStateWire::CompactPrevious { v, skills } => {
-                if v != PREVIOUS_INSTALLED_STATE_VERSION {
+            InstalledStateWire::CompactLegacy { v, skills } => {
+                if v != LEGACY_COMPACT_STATE_VERSION {
                     return Err(serde::de::Error::custom(format!(
-                        "unsupported installed state schema version {v}; expected {PREVIOUS_INSTALLED_STATE_VERSION}"
+                        "unsupported installed state schema version {v}; expected {LEGACY_COMPACT_STATE_VERSION}"
                     )));
                 }
                 Ok(Self {
@@ -291,6 +329,7 @@ impl<'de> Deserialize<'de> for InstalledState {
                                     mode: mode.into(),
                                     gitignore,
                                     digest: None,
+                                    content_digest: None,
                                     legacy_path: None,
                                 },
                             )
@@ -319,6 +358,7 @@ impl<'de> Deserialize<'de> for InstalledState {
                             mode: skill.mode,
                             gitignore: skill.gitignore,
                             digest: None,
+                            content_digest: None,
                             legacy_path: Some(skill.path),
                         },
                     );
@@ -382,11 +422,12 @@ pub fn validate_schema(version: u32, kind: &str) -> Result<()> {
 
 pub fn validate_installed_state(version: u32) -> Result<()> {
     if version != SCHEMA_VERSION
+        && version != LEGACY_COMPACT_STATE_VERSION
         && version != PREVIOUS_INSTALLED_STATE_VERSION
         && version != INSTALLED_STATE_VERSION
     {
         bail!(
-            "unsupported installed state schema version {version}; expected {SCHEMA_VERSION}, {PREVIOUS_INSTALLED_STATE_VERSION}, or {INSTALLED_STATE_VERSION}"
+            "unsupported installed state schema version {version}; expected {SCHEMA_VERSION} through {INSTALLED_STATE_VERSION}"
         );
     }
     Ok(())
@@ -451,16 +492,22 @@ mod tests {
         let compact = serde_json::to_string(&state).unwrap();
         assert_eq!(
             compact,
-            r#"{"v":3,"skills":{"pyg/learn":["learn-learning","e",false,""]}}"#
+            r#"{"v":4,"skills":{"pyg/learn":["learn-learning","e",false,"",""]}}"#
         );
         let round_trip: InstalledState = serde_json::from_str(&compact).unwrap();
         assert_eq!(round_trip.version, INSTALLED_STATE_VERSION);
         assert_eq!(round_trip.skills["pyg/learn"].mode, EffectiveMode::Enable);
-        let previous: InstalledState =
+        let previous: InstalledState = serde_json::from_str(
+            r#"{"v":3,"skills":{"pyg/learn":["learn-learning","e",false,"base"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(previous.version, PREVIOUS_INSTALLED_STATE_VERSION);
+        assert_eq!(previous.skills["pyg/learn"].digest.as_deref(), Some("base"));
+        assert!(previous.skills["pyg/learn"].content_digest.is_none());
+        let compact_legacy: InstalledState =
             serde_json::from_str(r#"{"v":2,"skills":{"pyg/learn":["learn-learning","e",false]}}"#)
                 .unwrap();
-        assert_eq!(previous.version, PREVIOUS_INSTALLED_STATE_VERSION);
-        assert!(previous.skills["pyg/learn"].digest.is_none());
+        assert_eq!(compact_legacy.version, LEGACY_COMPACT_STATE_VERSION);
     }
 
     #[test]

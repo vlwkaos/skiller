@@ -20,7 +20,6 @@ pub struct CatalogIndex {
     pub alias: String,
     pub source: String,
     pub root: PathBuf,
-    pub revision: Option<String>,
     pub metadata: CatalogMetadata,
     pub skills: BTreeMap<String, CatalogSkill>,
 }
@@ -84,55 +83,24 @@ pub fn load_global_config() -> Result<GlobalConfig> {
     Ok(config)
 }
 
-pub fn add_catalog(alias: &str, source: &str) -> Result<()> {
-    let config = load_global_config()?;
-    if config.catalogs.contains_key(alias) {
-        bail!("catalog alias already exists: {alias}");
-    }
-    configure_catalog(alias, Some(source), None, false, None, false)
-}
-
 pub fn configure_catalog(
     alias: &str,
-    source: Option<&str>,
+    source: &str,
     reference: Option<&str>,
-    clear_ref: bool,
     authoring_root: Option<&Path>,
-    clear_authoring_root: bool,
 ) -> Result<()> {
     validate_alias(alias)?;
-    let mut config = load_global_config()?;
-    let existing = config.catalogs.get(alias).cloned();
-    let source = source
-        .map(str::to_owned)
-        .or_else(|| existing.as_ref().map(|value| value.source.clone()))
-        .with_context(|| format!("new catalog {alias} requires --source"))?;
     if source.trim().is_empty() {
         bail!("catalog source cannot be empty");
     }
-    let configured_ref = if clear_ref {
-        None
-    } else {
-        reference
-            .map(str::to_owned)
-            .or_else(|| existing.as_ref().and_then(|value| value.r#ref.clone()))
-    };
-    let configured_authoring = if clear_authoring_root {
-        None
-    } else {
-        authoring_root
-            .map(|path| path.display().to_string())
-            .or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|value| value.authoring_root.clone())
-            })
-    };
-    if let Some(root) = &configured_authoring {
-        validate_authoring_root(alias, Path::new(root))?;
-    }
+    let mut config = load_global_config()?;
+    let configured_ref = reference.map(str::to_owned);
+    let configured_authoring = authoring_root
+        .map(|root| validate_authoring_root(alias, root))
+        .transpose()?
+        .map(|root| root.display().to_string());
     let registration = CatalogRegistration {
-        source,
+        source: source.to_owned(),
         r#ref: configured_ref,
         authoring_root: configured_authoring,
     };
@@ -161,6 +129,27 @@ fn validate_authoring_root(alias: &str, root: &Path) -> Result<PathBuf> {
 
 // ^ README.md#catalog-authoring owns the explicit checkout and eligibility boundary.
 pub fn add_skill(
+    alias: &str,
+    source: &Path,
+    scope: &str,
+    eligibility: CatalogEligibility,
+) -> Result<()> {
+    validate_alias(alias)?;
+    let config = load_global_config()?;
+    let registration = config
+        .catalogs
+        .get(alias)
+        .with_context(|| format!("catalog is not configured: {alias}"))?;
+    let configured = registration
+        .authoring_root
+        .as_deref()
+        .or((registration.r#ref.is_none()).then_some(registration.source.as_str()))
+        .with_context(|| format!("catalog {alias} requires an explicit authoring root"))?;
+    let root = validate_authoring_root(alias, Path::new(configured))?;
+    add_skill_at_root(&root, source, scope, eligibility)
+}
+
+fn add_skill_at_root(
     catalog_root: &Path,
     source: &Path,
     scope: &str,
@@ -284,16 +273,6 @@ pub fn add_skill(
         }
     );
     Ok(())
-}
-
-pub fn sync_registered_catalogs(config: &GlobalConfig) -> Result<BTreeMap<String, CatalogIndex>> {
-    config
-        .catalogs
-        .iter()
-        .map(|(alias, registration)| {
-            sync_catalog(alias, registration).map(|catalog| (alias.clone(), catalog))
-        })
-        .collect()
 }
 
 pub fn sync_catalog(alias: &str, registration: &CatalogRegistration) -> Result<CatalogIndex> {
@@ -682,19 +661,13 @@ pub(crate) fn scan_catalog(alias: &str, source: &str, root: &Path) -> Result<Cat
     }
     validate_dependencies(&skills)?;
     validate_renames(&metadata, &skills)?;
-    let revision = git_revision(root)?;
     Ok(CatalogIndex {
         alias: alias.to_owned(),
         source: source.to_owned(),
         root: root.to_owned(),
-        revision,
         metadata,
         skills,
     })
-}
-
-pub(crate) fn source_skill_name(directory: &Path) -> Result<String> {
-    Ok(read_skill_directory(directory, CatalogSkillMetadata::default())?.name)
 }
 
 fn read_skill_directory(directory: &Path, metadata: CatalogSkillMetadata) -> Result<CatalogSkill> {
@@ -735,19 +708,6 @@ fn read_skill_directory(directory: &Path, metadata: CatalogSkillMetadata) -> Res
         global: metadata.global,
         requires,
     })
-}
-
-fn git_revision(root: &Path) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(root)
-        .output()
-        .with_context(|| format!("reading catalog revision from {}", root.display()))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let revision = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    Ok((!revision.is_empty()).then_some(revision))
 }
 
 pub(crate) fn directory_digest(root: &Path) -> Result<String> {
@@ -1104,7 +1064,7 @@ mod tests {
         )
         .unwrap();
 
-        add_skill(&root, &source, "learning", CatalogEligibility::Global).unwrap();
+        add_skill_at_root(&root, &source, "learning", CatalogEligibility::Global).unwrap();
         assert!(root.join("skills/learn/SKILL.md").is_file());
         let metadata: CatalogMetadata = read_json(&root.join("skiller.json")).unwrap();
         assert_eq!(
@@ -1115,7 +1075,7 @@ mod tests {
             }
         );
         assert!(
-            add_skill(&root, &source, "missing", CatalogEligibility::Project)
+            add_skill_at_root(&root, &source, "missing", CatalogEligibility::Project)
                 .unwrap_err()
                 .to_string()
                 .contains("no scope")
@@ -1149,7 +1109,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = add_skill(&root, &source, "test", CatalogEligibility::Global)
+        let error = add_skill_at_root(&root, &source, "test", CatalogEligibility::Global)
             .unwrap_err()
             .to_string();
         assert!(error.contains("project-only skill helper"));
@@ -1190,7 +1150,7 @@ mod tests {
         std::fs::write(base.join("outside.txt"), "outside").unwrap();
         symlink(base.join("outside.txt"), source.join("escape")).unwrap();
 
-        let error = add_skill(&root, &source, "test", CatalogEligibility::Global)
+        let error = add_skill_at_root(&root, &source, "test", CatalogEligibility::Global)
             .unwrap_err()
             .to_string();
         assert!(error.contains("symlink"));

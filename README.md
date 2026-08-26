@@ -1,26 +1,21 @@
 # skiller
 
-Declarative Agent Skill catalog, configuration, migration, and installation over pinned Vercel Skills.
+Declarative Agent Skill catalogs and convergent project/global installation over pinned Vercel Skills.
 
 ## Commands
 
 ```bash
-skiller catalog configure <alias> --source <source> [--ref <ref>] [--authoring-root <path>]
-skiller add-catalog <alias> <source> # compatibility alias
-skiller catalog add-skill --root <catalog> --source <skill> --scope <scope> --global|--project
-skiller config [-g] [--print] [--set catalog/name=enable|manual|off]
-skiller config [-g] --agent <agent> [--agent <agent>...]
-skiller update [-g] --check [--json]
+skiller catalog configure <alias> <source> [--ref <ref>] [--authoring-root <path>]
+skiller catalog add-skill <alias> <skill> <scope> [--global]
+skiller config [-g] [--set catalog/name=STATE] [--agents universal,claude-code,pi]
 skiller update [-g] [--yes]
 skiller install [-g]
-skiller doctor [-g] [--print|--repair [--yes]]
-skiller migrate
-skiller migrate --init migration.json
-skiller migrate --plan migration.json --check
-skiller migrate --plan migration.json --apply [--yes]
+skiller doctor [-g] [--repair [--yes]]
 ```
 
-`catalog configure` registers or updates canonical source, ref, and optional explicit owner checkout. Local source and authoring paths may start with `~/` for portable dotfiles configuration. `config` edits desired selection. `config --print` also reports machine-local authoring provenance and whether it is the canonical source. `update --check` reports published and unpublished authoring differences without installation. `update` requires confirmation and installs canonical catalog content. `install` performs full canonical reconciliation, including safe rename repair, exact-content adoption, independent progress, and inline owned recovery. `doctor` diagnoses and explicitly repairs owned state. `migrate` guides legacy skills into a writable catalog, creates configuration, and optionally installs and cleans exact approved legacy names.
+`STATE` is `enable`, `manual`, `enable-ignored`, `manual-ignored`, or `off`. Project is the safe default for new catalog skills; `--global` is explicit.
+
+Read-only commands choose output automatically. A TTY gets the organized interactive or human view. A pipe, agent, or subprocess gets compact one-line JSON. `config` and `doctor` use synchronized cache only; `update` and `install` own remote refresh.
 
 ## Configuration
 
@@ -31,7 +26,7 @@ Global configuration is `~/.config/skiller/config.json`. Project configuration i
   "version": 1,
   "catalogs": {
     "pyg": {
-      "source": "git@github.com:vlwkaos/skills.git",
+      "source": "git@github.com:owner/skills.git",
       "ref": "main",
       "authoring_root": "/explicit/local/checkout"
     }
@@ -44,43 +39,41 @@ Global configuration is `~/.config/skiller/config.json`. Project configuration i
 }
 ```
 
-`source` and optional `ref` define canonical consumer content. `authoring_root` is an optional explicit writable checkout used only to detect unpublished owner changes; installation always uses canonical content. At least one Vercel agent is required. Agent names pass to `skills@1.5.23`, which performs final validation and placement. Project configuration omits `catalogs` but has the same `agents` and `skills` fields.
+Canonical `source` and optional `ref` own consumer content. `authoring_root` is an optional writable checkout used for guidance and unpublished-draft checks. Installation always uses canonical content.
 
 Enabled skills allow agent and human invocation. Manual skills are human-only unless required. Unselected dependencies are agent-only. Dependency reachability never changes configured selection.
 
+## Project reconciliation
+
+Global projections are canonical. Project projections are writable working content tracked against the exact tree Skiller last installed.
+
+| Status | Meaning | Install behavior |
+|---|---|---|
+| `synced` | Project matches its baseline | Apply incoming catalog updates |
+| `keep-local` | Only project content changed | Preserve the complete project skill |
+| `conflict` | Project and catalog changed | Preserve, block the skill and dependents, return nonzero |
+| `orphaned-local` | Upstream removal/rename would discard project work | Preserve and require manual review |
+| `unknown` | Older state has no exact baseline | Preserve conservatively until reconciled |
+
+Config JSON and the TUI show the sync state and validated authoring skill path. Skiller never promotes, merges, commits, or publishes project edits. Matching current canonical content resolves divergence automatically.
+
 ## Catalog
 
-```json
-{
-  "version": 1,
-  "scopes": {
-    "engineering": { "label": "Engineering", "order": 10 }
-  },
-  "skills": {
-    "develop": { "scope": "engineering", "global": true }
-  },
-  "renames": {
-    "old-develop": "develop"
-  }
-}
-```
+`skiller.json` declares semantic scopes, eligibility, and renames. Dependencies use comma-separated `metadata.skiller.requires`. Missing dependencies, cycles, invalid rename chains, eligibility mismatches, symlinks, and installed-name collisions are hard errors.
 
-Source and installed names stay clean, such as `develop`. Skiller adds scope to projected descriptions, such as `[engineering] Develop features safely.` Pygmalion may still expose `$engineering:develop` aliases.
-
-Dependencies use comma-separated `metadata.skiller.requires`. Missing dependencies, cycles, invalid rename chains, eligibility mismatches, symlinks, and selected-name collisions are hard errors.
+`catalog add-skill` resolves the alias's validated authoring checkout. It no longer accepts an arbitrary catalog root. Legacy migration uses the bundled `skiller-migrate` guidance with normal catalog, config, and install commands.
 
 ## Safety
 
-- Catalog authoring and migration require an explicit writable checkout and portable source.
-- Migration never commits or pushes.
-- Legacy cleanup is disabled by default and runs only after verified installation.
-- Doctor is read-only unless `--repair` is supplied.
-- Noninteractive mutation requires `--yes`.
-- Skiller removes only prior ownership or exact validated migration/recovery names.
-- Installed state is compact schema 3 under the XDG state directory and records deterministic projected-content digests.
-- Catalog checks may refresh caches but never install; updates remain confirmation-gated. Unreachable sources are warned once and skipped for that reconciliation; a readable prior cache is shown as read-only stale metadata. `config --print`, `update --check --json`, and `doctor --print` expose a camelCase `catalogStatus` array with alias, availability/stale state, declared and installed counts, and a sanitized warning.
-- Installed skill directories are read-only projections. Skills write only to explicit project, XDG state/cache, or catalog authoring paths; Skiller remains the projection writer.
-- Interrupted installation retains an owned transaction journal that a later `install` resumes when its scope and desired names still validate.
-- Vercel listing is bounded to 15 seconds and placement to 60 seconds. Permission, sandbox, network, timeout, placement, and state failures are reported separately without speculative ownership advice.
+- Skiller removes only verified ownership or exact approved recovery names.
+- Unowned projections are adopted only when every discovered copy is byte-identical.
+- Installed state is compact schema 4 and records catalog identity plus exact content baseline.
+- Install resumes only validated interrupted transactions and retains independent per-skill progress.
+- Modified project skills are never removed, renamed, or overwritten automatically.
+- Global installed directories remain read-only projections; project projections may carry tracked overrides.
+- Vercel listing is bounded to 15 seconds and placement to 60 seconds.
+- Git SSH acquisition is bounded and repeated unreachable sources are suppressed briefly.
+- Permission, process, network, timeout, placement, and state failures are classified separately.
+- Mutation remains explicit: `update --yes`, `doctor --repair`, and `doctor --repair --yes` for reviewed automation.
 
-The guided migration procedure is also available as `skills/skiller-migrate/SKILL.md` in this repository.
+Skiller pins `skills@1.5.23` for final validation and placement.

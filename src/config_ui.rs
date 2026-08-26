@@ -1,15 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::catalog::{
     CatalogAvailability, CatalogIndex, CatalogStatus, load_global_config,
-    sync_registered_catalogs_cached, sync_registered_catalogs_resilient,
+    sync_registered_catalogs_cached,
 };
-use crate::installer::InstallScope;
+use crate::installer::{
+    InstallScope, ProjectionStatus, ResolvedSkill, projection_status, resolve_manifest,
+};
 use crate::model::{
     EffectiveMode, InstalledState, ProjectConfig, SelectionMode, SkillSelection,
     validate_installed_state, validate_schema,
@@ -23,30 +25,108 @@ use crate::paths::{
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConfigRow {
     pub(crate) key: String,
+    #[serde(skip)]
     pub(crate) catalog: String,
     pub(crate) scope: String,
     pub(crate) scope_order: i32,
+    #[serde(skip)]
     pub(crate) name: String,
     pub(crate) installed_name: String,
     pub(crate) description: String,
-    pub(crate) global: bool,
+    #[serde(rename = "want", skip_serializing_if = "Option::is_none")]
     pub(crate) selected: Option<SelectionMode>,
+    #[serde(skip_serializing_if = "is_false")]
     pub(crate) gitignore: bool,
+    #[serde(skip)]
     pub(crate) installed: bool,
+    #[serde(rename = "have", skip_serializing_if = "Option::is_none")]
     pub(crate) installed_mode: Option<EffectiveMode>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) required_by: Vec<String>,
+    #[serde(skip_serializing_if = "is_false")]
     pub(crate) read_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sync: Option<ProjectionStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) authoring: Option<String>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PrintedConfig<'a> {
     scope: &'a str,
+    #[serde(rename = "config")]
     config_path: String,
     agents: &'a [String],
-    skills: &'a [ConfigRow],
+    summary: ConfigSummary,
+    skills: Vec<PrintedSkill<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     catalog_status: Vec<PrintedCatalogStatus>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrintedSkill<'a> {
+    key: &'a str,
+    scope: &'a str,
+    scope_order: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installed_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    #[serde(rename = "want", skip_serializing_if = "Option::is_none")]
+    selected: Option<SelectionMode>,
+    #[serde(skip_serializing_if = "is_false")]
+    gitignore: bool,
+    #[serde(rename = "have", skip_serializing_if = "Option::is_none")]
+    installed_mode: Option<EffectiveMode>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    required_by: &'a Vec<String>,
+    #[serde(skip_serializing_if = "is_false")]
+    read_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'a str>,
+    #[serde(skip_serializing_if = "sync_is_default")]
+    sync: Option<ProjectionStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authoring: Option<&'a str>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn sync_is_default(value: &Option<ProjectionStatus>) -> bool {
+    matches!(value, None | Some(ProjectionStatus::Synced))
+}
+
+fn printed_skill(row: &ConfigRow) -> PrintedSkill<'_> {
+    let attention = !sync_is_default(&row.sync) || row.status.is_some();
+    PrintedSkill {
+        key: &row.key,
+        scope: &row.scope,
+        scope_order: row.scope_order,
+        installed_name: (row.installed_name != row.name).then_some(row.installed_name.as_str()),
+        description: (!row.installed || row.selected.is_none() || attention)
+            .then_some(row.description.as_str()),
+        selected: row.selected,
+        gitignore: row.gitignore,
+        installed_mode: row.installed_mode,
+        required_by: &row.required_by,
+        read_only: row.read_only,
+        status: row.status.as_deref(),
+        sync: row.sync,
+        authoring: row.authoring.as_deref(),
+    }
+}
+
+#[derive(Serialize)]
+struct ConfigSummary {
+    selected: usize,
+    installed: usize,
+    attention: usize,
 }
 
 #[derive(Serialize)]
@@ -66,20 +146,16 @@ struct PrintedCatalogStatus {
 
 pub fn configure(
     scope: InstallScope,
-    print_only: bool,
+    machine: bool,
     assignments: &[String],
-    gitignore_assignments: &[String],
     agents: &[String],
 ) -> Result<()> {
     let mut global_config = load_global_config()?;
     if global_config.catalogs.is_empty() {
-        anyhow::bail!("no catalogs configured; run `skiller add-catalog <alias> <source>`");
+        anyhow::bail!("no catalogs configured; run `skiller catalog configure <alias> <source>`");
     }
-    let sync = if print_only {
-        sync_registered_catalogs_cached(&global_config)?
-    } else {
-        sync_registered_catalogs_resilient(&global_config)?
-    };
+    let read_only = machine && assignments.is_empty() && agents.is_empty();
+    let sync = sync_registered_catalogs_cached(&global_config)?;
     let catalogs = sync.catalogs.clone();
     let (config_path, state_path, mut manifest) = match &scope {
         InstallScope::Project(project_root) => {
@@ -118,15 +194,47 @@ pub fn configure(
             display_catalogs.insert(alias.clone(), catalog.clone());
         }
     }
-    let rows = config_rows(
+    let mut active_manifest = manifest.clone();
+    active_manifest.skills.retain(|key, _| {
+        key.split_once('/')
+            .is_some_and(|(alias, _)| catalogs.contains_key(alias))
+    });
+    let desired = resolve_manifest(&active_manifest, &catalogs, scope.is_global())?;
+    let desired_by_key: BTreeMap<_, _> = desired
+        .iter()
+        .map(|skill| (skill.key.as_str(), skill))
+        .collect();
+    let project_root = match &scope {
+        InstallScope::Project(root) => Some(root.as_path()),
+        InstallScope::Global => None,
+    };
+    let mut rows = config_rows(
         &display_catalogs,
         &state,
         &manifest,
         scope.is_global(),
+        project_root,
+        &desired_by_key,
         &stale_aliases,
-    );
+    )?;
+    for row in &mut rows {
+        if matches!(
+            row.sync,
+            Some(
+                ProjectionStatus::KeepLocal
+                    | ProjectionStatus::Conflict
+                    | ProjectionStatus::OrphanedLocal
+            )
+        ) {
+            row.authoring = global_config
+                .catalogs
+                .get(&row.catalog)
+                .and_then(authoring_root_path)
+                .map(|root| root.join("skills").join(&row.name).display().to_string());
+        }
+    }
 
-    if print_only {
+    if read_only {
         let output = PrintedConfig {
             scope: if scope.is_global() {
                 "global"
@@ -135,7 +243,18 @@ pub fn configure(
             },
             config_path: config_path.display().to_string(),
             agents: &manifest.agents,
-            skills: &rows,
+            summary: ConfigSummary {
+                selected: manifest.skills.len(),
+                installed: rows.iter().filter(|row| row.installed).count(),
+                attention: rows
+                    .iter()
+                    .filter(|row| {
+                        !matches!(row.sync, None | Some(ProjectionStatus::Synced))
+                            || row.status.is_some()
+                    })
+                    .count(),
+            },
+            skills: rows.iter().map(printed_skill).collect(),
             catalog_status: printed_catalog_statuses(
                 &sync.statuses,
                 &manifest,
@@ -143,17 +262,11 @@ pub fn configure(
                 &global_config.catalogs,
             ),
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        println!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
-    if !assignments.is_empty() || !gitignore_assignments.is_empty() || !agents.is_empty() {
-        apply_assignments(&mut manifest, &rows, assignments)?;
-        apply_gitignore_assignments(
-            &mut manifest,
-            &rows,
-            gitignore_assignments,
-            scope.is_global(),
-        )?;
+    if !assignments.is_empty() || !agents.is_empty() {
+        apply_assignments(&mut manifest, &rows, assignments, scope.is_global())?;
         if !agents.is_empty() {
             crate::installer::validate_agents(agents)?;
             manifest.agents = agents.to_vec();
@@ -198,8 +311,10 @@ fn config_rows(
     state: &InstalledState,
     manifest: &ProjectConfig,
     global_scope: bool,
+    project_root: Option<&Path>,
+    desired: &BTreeMap<&str, &ResolvedSkill<'_>>,
     stale_aliases: &BTreeSet<String>,
-) -> Vec<ConfigRow> {
+) -> Result<Vec<ConfigRow>> {
     let mut rows: Vec<_> = catalogs
         .values()
         .flat_map(|catalog| {
@@ -238,7 +353,6 @@ fn config_rows(
                         installed_mode: installed.map(|skill| skill.mode),
                         installed_name,
                         description: skill.description.clone(),
-                        global: skill.global,
                         selected: selection.map(SkillSelection::mode),
                         gitignore: selection.is_some_and(SkillSelection::gitignore),
                         required_by,
@@ -246,10 +360,67 @@ fn config_rows(
                         status: stale_aliases
                             .contains(&catalog.alias)
                             .then_some("stale".to_owned()),
+                        sync: None,
+                        authoring: None,
                     }
                 })
         })
         .collect();
+    if let Some(project_root) = project_root {
+        for (key, installed) in &state.skills {
+            if rows.iter().any(|row| &row.key == key) {
+                continue;
+            }
+            let actual = project_root
+                .join(".agents/skills")
+                .join(&installed.installed_name);
+            if !matches!(
+                projection_status(false, installed, None, &actual)?,
+                ProjectionStatus::KeepLocal
+                    | ProjectionStatus::Conflict
+                    | ProjectionStatus::Unknown
+            ) {
+                continue;
+            }
+            let Some((catalog, name)) = key.split_once('/') else {
+                continue;
+            };
+            let selection = manifest.skills.get(key);
+            rows.push(ConfigRow {
+                key: key.clone(),
+                catalog: catalog.to_owned(),
+                scope: "other".to_owned(),
+                scope_order: i32::MAX,
+                name: name.to_owned(),
+                installed_name: installed.installed_name.clone(),
+                description: "Project override whose catalog entry is unavailable.".to_owned(),
+                selected: selection.map(SkillSelection::mode),
+                gitignore: selection.is_some_and(SkillSelection::gitignore),
+                installed: true,
+                installed_mode: Some(installed.mode),
+                required_by: Vec::new(),
+                read_only: true,
+                status: Some("orphaned".to_owned()),
+                sync: Some(ProjectionStatus::OrphanedLocal),
+                authoring: None,
+            });
+        }
+    }
+    let projection_root = project_root
+        .map(Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(crate::paths::global_skills_root)?;
+    for row in &mut rows {
+        let Some(installed) = state.skills.get(&row.key) else {
+            continue;
+        };
+        row.sync = Some(projection_status(
+            global_scope,
+            installed,
+            desired.get(row.key.as_str()).copied(),
+            &projection_root.join(&installed.installed_name),
+        )?);
+    }
     rows.sort_by(|left, right| {
         left.catalog
             .cmp(&right.catalog)
@@ -257,7 +428,17 @@ fn config_rows(
             .then(left.scope.cmp(&right.scope))
             .then(left.name.cmp(&right.name))
     });
-    rows
+    Ok(rows)
+}
+
+fn authoring_root_path(registration: &crate::model::CatalogRegistration) -> Option<PathBuf> {
+    let configured = registration
+        .authoring_root
+        .as_deref()
+        .or((registration.r#ref.is_none()).then_some(registration.source.as_str()))?;
+    expand_home_path(configured)
+        .ok()
+        .filter(|path| path.is_dir())
 }
 
 fn printed_catalog_statuses(
@@ -287,14 +468,10 @@ fn printed_catalog_statuses(
                 .filter(|key| key.starts_with(&format!("{}/", status.alias)))
                 .count(),
             warning: status.warning.clone(),
-            authoring_path: registrations.get(&status.alias).and_then(|registration| {
-                let configured = registration.authoring_root.as_deref().unwrap_or(&registration.source);
-                (registration.authoring_root.is_some() || registration.r#ref.is_none())
-                    .then(|| expand_home_path(configured).ok())
-                    .flatten()
-                    .filter(|path| path.is_dir())
-                    .map(|path| path.display().to_string())
-            }),
+            authoring_path: registrations
+                .get(&status.alias)
+                .and_then(authoring_root_path)
+                .map(|path| path.display().to_string()),
             authoring_is_canonical: registrations.get(&status.alias).is_some_and(|registration| {
                 if registration.r#ref.is_some() {
                     return false;
@@ -310,20 +487,34 @@ fn printed_catalog_statuses(
         .collect()
 }
 
+pub(crate) fn row_editable(row: &ConfigRow) -> bool {
+    !row.read_only
+        && !matches!(
+            row.sync,
+            Some(
+                ProjectionStatus::KeepLocal
+                    | ProjectionStatus::Conflict
+                    | ProjectionStatus::OrphanedLocal
+                    | ProjectionStatus::Unknown
+            )
+        )
+}
+
 fn apply_assignments(
     manifest: &mut ProjectConfig,
     rows: &[ConfigRow],
     assignments: &[String],
+    global_scope: bool,
 ) -> Result<()> {
     let available: BTreeSet<_> = rows
         .iter()
-        .filter(|row| !row.read_only)
+        .filter(|row| row_editable(row))
         .map(|row| row.key.as_str())
         .collect();
     let mut seen = BTreeSet::new();
     for assignment in assignments {
-        let (key, mode) = assignment.split_once('=').with_context(|| {
-            format!("invalid selection {assignment:?}; expected catalog/name=enable|manual|off")
+        let (key, state) = assignment.split_once('=').with_context(|| {
+            format!("invalid selection {assignment:?}; expected catalog/name=STATE")
         })?;
         if !available.contains(key) {
             anyhow::bail!("skill is unavailable in this configuration: {key}");
@@ -331,72 +522,23 @@ fn apply_assignments(
         if !seen.insert(key) {
             anyhow::bail!("duplicate skill selection: {key}");
         }
-        let gitignore = manifest
-            .skills
-            .get(key)
-            .is_some_and(SkillSelection::gitignore);
-        match mode {
-            "enable" => {
-                manifest.skills.insert(
-                    key.to_owned(),
-                    SkillSelection::from_parts(SelectionMode::Enable, gitignore),
-                );
-            }
-            "manual" => {
-                manifest.skills.insert(
-                    key.to_owned(),
-                    SkillSelection::from_parts(SelectionMode::Manual, gitignore),
-                );
-            }
-            "off" => {
-                manifest.skills.remove(key);
-            }
-            _ => anyhow::bail!("invalid mode for {key}: {mode}; expected enable, manual, or off"),
-        }
-    }
-    Ok(())
-}
-
-fn apply_gitignore_assignments(
-    manifest: &mut ProjectConfig,
-    rows: &[ConfigRow],
-    assignments: &[String],
-    global_scope: bool,
-) -> Result<()> {
-    if global_scope && !assignments.is_empty() {
-        anyhow::bail!("global skill configuration does not support Git ignore state");
-    }
-    let available: BTreeSet<_> = rows
-        .iter()
-        .filter(|row| !row.read_only)
-        .map(|row| row.key.as_str())
-        .collect();
-    let mut seen = BTreeSet::new();
-    for assignment in assignments {
-        let (key, value) = assignment.split_once('=').with_context(|| {
-            format!("invalid Git ignore state {assignment:?}; expected catalog/name=true|false")
-        })?;
-        if !available.contains(key) {
-            anyhow::bail!("skill is unavailable in this configuration: {key}");
-        }
-        if !seen.insert(key) {
-            anyhow::bail!("duplicate Git ignore state: {key}");
-        }
-        let gitignore = match value {
-            "true" => true,
-            "false" => false,
-            _ => {
-                anyhow::bail!("invalid Git ignore state for {key}: {value}; expected true or false")
-            }
+        let selection = match state {
+            "enable" => Some((SelectionMode::Enable, false)),
+            "manual" => Some((SelectionMode::Manual, false)),
+            "enable-ignored" if !global_scope => Some((SelectionMode::Enable, true)),
+            "manual-ignored" if !global_scope => Some((SelectionMode::Manual, true)),
+            "off" => None,
+            _ => anyhow::bail!(
+                "invalid state for {key}: {state}; expected enable, manual, enable-ignored, manual-ignored, or off"
+            ),
         };
-        let selection = manifest
-            .skills
-            .get(key)
-            .with_context(|| format!("select {key} before changing its Git ignore state"))?;
-        manifest.skills.insert(
-            key.to_owned(),
-            SkillSelection::from_parts(selection.mode(), gitignore),
-        );
+        if let Some((mode, ignored)) = selection {
+            manifest
+                .skills
+                .insert(key.to_owned(), SkillSelection::from_parts(mode, ignored));
+        } else {
+            manifest.skills.remove(key);
+        }
     }
     Ok(())
 }
@@ -497,7 +639,6 @@ mod tests {
             name: "develop".to_owned(),
             installed_name: "develop".to_owned(),
             description: "Develop".to_owned(),
-            global: true,
             selected: None,
             gitignore: false,
             installed: false,
@@ -505,24 +646,38 @@ mod tests {
             required_by: Vec::new(),
             read_only: false,
             status: None,
+            sync: None,
+            authoring: None,
         }];
         let mut manifest = ProjectConfig::default();
-        apply_assignments(&mut manifest, &rows, &["pyg/develop=enable".to_owned()]).unwrap();
-        assert_eq!(manifest.skills["pyg/develop"].mode(), SelectionMode::Enable);
-        apply_gitignore_assignments(
+        apply_assignments(
             &mut manifest,
             &rows,
-            &["pyg/develop=true".to_owned()],
+            &["pyg/develop=enable-ignored".to_owned()],
             false,
         )
         .unwrap();
-        apply_assignments(&mut manifest, &rows, &["pyg/develop=manual".to_owned()]).unwrap();
-        assert_eq!(manifest.skills["pyg/develop"].mode(), SelectionMode::Manual);
+        assert_eq!(manifest.skills["pyg/develop"].mode(), SelectionMode::Enable);
         assert!(manifest.skills["pyg/develop"].gitignore());
-        apply_assignments(&mut manifest, &rows, &["pyg/develop=off".to_owned()]).unwrap();
+        apply_assignments(
+            &mut manifest,
+            &rows,
+            &["pyg/develop=manual".to_owned()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(manifest.skills["pyg/develop"].mode(), SelectionMode::Manual);
+        assert!(!manifest.skills["pyg/develop"].gitignore());
+        apply_assignments(&mut manifest, &rows, &["pyg/develop=off".to_owned()], false).unwrap();
         assert!(!manifest.skills.contains_key("pyg/develop"));
         assert!(
-            apply_assignments(&mut manifest, &rows, &["pyg/missing=enable".to_owned()]).is_err()
+            apply_assignments(
+                &mut manifest,
+                &rows,
+                &["pyg/missing=enable".to_owned()],
+                false,
+            )
+            .is_err()
         );
         assert!(
             apply_assignments(
@@ -530,26 +685,18 @@ mod tests {
                 &rows,
                 &[
                     "pyg/develop=enable".to_owned(),
-                    "pyg/develop=manual".to_owned()
-                ]
+                    "pyg/develop=manual".to_owned(),
+                ],
+                false,
             )
             .is_err()
         );
         assert!(
-            apply_gitignore_assignments(
+            apply_assignments(
                 &mut manifest,
                 &rows,
-                &["pyg/develop=true".to_owned()],
+                &["pyg/develop=enable-ignored".to_owned()],
                 true,
-            )
-            .is_err()
-        );
-        assert!(
-            apply_gitignore_assignments(
-                &mut ProjectConfig::default(),
-                &rows,
-                &["pyg/develop=true".to_owned()],
-                false,
             )
             .is_err()
         );
@@ -580,6 +727,7 @@ mod tests {
                     mode: EffectiveMode::Enable,
                     gitignore: false,
                     digest: None,
+                    content_digest: None,
                     legacy_path: None,
                 },
             )]),
@@ -604,6 +752,7 @@ mod tests {
             mode: EffectiveMode::Enable,
             gitignore: false,
             digest: None,
+            content_digest: None,
             legacy_path: None,
         };
         assert!(!installed_name_is_current(&installed, "develop"));
@@ -616,7 +765,6 @@ mod tests {
             alias: "pyg".to_owned(),
             source: "test".to_owned(),
             root: PathBuf::from("."),
-            revision: None,
             metadata: CatalogMetadata::default(),
             skills: BTreeMap::from([
                 (
@@ -653,9 +801,21 @@ mod tests {
             &state,
             &manifest,
             true,
+            None,
+            &BTreeMap::new(),
             &BTreeSet::from(["pyg".to_owned()]),
-        );
-        let project = config_rows(&catalogs, &state, &manifest, false, &BTreeSet::new());
+        )
+        .unwrap();
+        let project = config_rows(
+            &catalogs,
+            &state,
+            &manifest,
+            false,
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert_eq!(global[0].name, "global");
         assert_eq!(global[0].installed_name, "global-scope");
         assert!(global[0].read_only);

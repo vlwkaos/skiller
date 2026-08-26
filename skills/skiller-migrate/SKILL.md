@@ -1,41 +1,40 @@
 ---
 name: skiller-migrate
-description: Guide legacy Agent Skills into an explicit Skiller catalog, configuration, selected Vercel agents, verified installation, and optional approved cleanup.
+description: Guide reviewed legacy Agent Skills into a configured Skiller catalog without editing installed projections or ownership state.
 ---
 
 # Skiller migration
 
-Use Skiller's migration-plan engine. The app owns validation, copying, configuration, installation, ownership, and cleanup. Never hand-edit installed projections, Skiller state, Vercel lock files, or generated links.
-
-## Choose the interface
-
-| Situation | Command |
-|---|---|
-| Human-guided migration | `skiller migrate` |
-| Create an agent-editable plan | `skiller migrate --init migration.json` |
-| Read-only deterministic validation | `skiller migrate --plan migration.json --check` |
-| Interactive plan application | `skiller migrate --plan migration.json --apply` |
-| Reviewed noninteractive application | `skiller migrate --plan migration.json --apply --yes` |
+Use Skiller's normal authoring, configuration, and reconciliation commands. Migration has no special binary mode.
 
 ## Workflow
 
-1. Run `skiller doctor [-g] --print` and retain the report.
-2. Resolve one explicit writable catalog checkout, alias, and portable source. Never infer among clones.
-3. Select canonical legacy skill directories. Prefer real directories under `.agents/skills`, not agent projection symlinks.
-4. For each skill, choose an existing catalog scope, global or project target, Enabled or Manual mode, project Git-ignore state, and exact legacy installed name.
-5. Select at least one Vercel agent. Defaults are `universal`, `claude-code`, and `pi`, but any can be removed or additional Vercel-supported names added.
-6. Keep `cleanupLegacy` false on the first review. Cleanup is a separate destructive approval and is valid only with installation enabled.
-7. Run `--check`. Resolve every invalid name, dependency, scope, eligibility, collision, symlink, or unowned path before applying.
-8. Show the complete plan and ask approval. Use `--yes` only when the user already approved that exact checked plan.
-9. Apply. Skiller copies catalog sources, creates configuration, installs through pinned Vercel Skills, verifies every selected agent through Vercel's JSON listing, and records ownership.
-10. Run Doctor again. After any physical-name migration, reload the current agent session before invoking skill-relative scripts; cached skill paths may still reference old names. Inspect the catalog diff before any commit or publication.
-11. If cleanup was deferred, create and check a second exact plan with `cleanupLegacy: true`; apply only after replacement installation is healthy.
-12. Report catalog/config/state paths, selected agents, modes, cleanup names, verification, and remaining commit/push/reload steps.
+1. Run `skiller doctor [-g]` and retain the non-TTY JSON report.
+2. Identify one canonical legacy skill directory. Prefer a real source directory, not an agent projection symlink.
+3. Resolve the target catalog alias and its validated authoring checkout with `skiller config -g`.
+4. Review the source name, `SKILL.md`, dependencies, scope, and global eligibility.
+5. Copy through Skiller:
+
+   ```bash
+   skiller catalog add-skill <alias> <source> <scope> [--global]
+   ```
+
+6. Inspect the catalog diff. Skiller does not commit or publish it.
+7. After the catalog change is canonical, select the skill:
+
+   ```bash
+   skiller config [-g] --set <alias>/<name>=enable|manual
+   skiller install [-g]
+   ```
+
+8. Run `skiller doctor [-g]` again and verify every configured agent projection.
+9. Ask separately before deleting any legacy source. Never delete a locally modified project override through migration.
+10. Report catalog, configuration, state, installed paths, mode, dependency closure, and remaining commit, push, cleanup, or reload steps.
 
 ## Boundaries
 
-- The migration command does not commit, push, publish, or choose company ownership.
-- A failed pre-install mutation rolls catalog metadata and newly copied skills back.
-- An install failure leaves valid catalog/config state and an owned recovery journal when placement started.
-- Never use migration to absorb unrelated same-name skills.
-- Source names remain unpostfixed. Semantic scope appears in projected descriptions as `[scope]` and in Pygmalion aliases as `$scope:name`.
+- Never edit installed projections, `.skiller/installed.json`, Vercel lock files, or generated links.
+- Do not absorb unrelated same-name skills.
+- Project is the default eligibility; `--global` is explicit.
+- Source names remain unpostfixed. Scope appears in projected descriptions and Pygmalion aliases.
+- A failed install preserves per-skill progress and reports unresolved blockers.

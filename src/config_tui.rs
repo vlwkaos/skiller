@@ -4,14 +4,14 @@ use anyhow::{Context, Result, bail};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{Event, KeyCode, KeyEventKind, read};
 use crossterm::execute;
-use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
     enable_raw_mode, size,
 };
 use unicode_width::UnicodeWidthChar;
 
-use crate::config_ui::{ConfigRow, cycle_selection, toggle_gitignore};
+use crate::config_ui::{ConfigRow, cycle_selection, row_editable, toggle_gitignore};
 use crate::model::{EffectiveMode, ProjectConfig, SelectionMode, SkillSelection};
 
 pub(crate) enum ConfigTuiResult {
@@ -23,7 +23,7 @@ struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen, ResetColor);
+        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }
@@ -34,7 +34,9 @@ pub(crate) fn run(
     global_scope: bool,
 ) -> Result<ConfigTuiResult> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        bail!("interactive config requires a terminal; use --print or --set for automation");
+        bail!(
+            "interactive config requires a terminal; run `skiller config` directly for JSON or use --set for mutation"
+        );
     }
     enable_raw_mode().context("enabling terminal raw mode")?;
     let _guard = TerminalGuard;
@@ -58,13 +60,13 @@ pub(crate) fn run(
             KeyCode::PageDown => selected = (selected + 10).min(rows.len().saturating_sub(1)),
             KeyCode::Home => selected = 0,
             KeyCode::End => selected = rows.len().saturating_sub(1),
-            KeyCode::Char(' ') if !rows.is_empty() && !rows[selected].read_only => {
+            KeyCode::Char(' ') if !rows.is_empty() && row_editable(&rows[selected]) => {
                 cycle_selection(manifest, &rows[selected].key)
             }
             KeyCode::Char('i')
                 if !global_scope
                     && !rows.is_empty()
-                    && !rows[selected].read_only
+                    && row_editable(&rows[selected])
                     && manifest.skills.contains_key(&rows[selected].key) =>
             {
                 toggle_gitignore(manifest, &rows[selected].key);
@@ -96,22 +98,11 @@ fn draw(
     for (index, line) in lines.iter().enumerate() {
         execute!(output, MoveTo(0, index as u16))?;
         if index == 0 {
-            execute!(
-                output,
-                SetForegroundColor(Color::Cyan),
-                SetAttribute(Attribute::Bold)
-            )?;
+            execute!(output, SetAttribute(Attribute::Bold))?;
         } else if line.starts_with('›') {
             execute!(output, SetAttribute(Attribute::Reverse))?;
-        } else if line.starts_with("  ") && index + 2 >= lines.len() {
-            execute!(output, SetForegroundColor(Color::DarkGrey))?;
         }
-        execute!(
-            output,
-            Print(line),
-            ResetColor,
-            SetAttribute(Attribute::Reset)
-        )?;
+        execute!(output, Print(line), SetAttribute(Attribute::Reset))?;
     }
     output.flush()?;
     Ok(())
@@ -128,7 +119,7 @@ pub(crate) fn view_lines(
     let width = width.max(1);
     let height = height.max(1);
     let selected = selected.min(rows.len().saturating_sub(1));
-    let body_height = height.saturating_sub(6).max(1);
+    let body_height = height.saturating_sub(7).max(1);
     let start = selected.saturating_sub(body_height.saturating_sub(1));
     let end = (start + body_height).min(rows.len());
     let title = if global_scope {
@@ -136,11 +127,29 @@ pub(crate) fn view_lines(
     } else {
         "Skiller · Project Skills"
     };
+    let selected_count = manifest.skills.len();
+    let attention = rows
+        .iter()
+        .filter(|row| {
+            !matches!(
+                row.sync,
+                None | Some(crate::installer::ProjectionStatus::Synced)
+            )
+        })
+        .count();
     let mut lines = vec![fit(title, width)];
     if let Some(row) = rows.get(selected) {
-        lines.push(fit(&format!("{} / {}", row.catalog, row.scope), width));
+        lines.push(fit(
+            &format!(
+                "{} / {} · {selected_count} selected · {attention} attention",
+                row.catalog, row.scope
+            ),
+            width,
+        ));
+        lines.push(fit("  Mode  Status       Skill → projection", width));
     } else {
         lines.push(fit("No catalog skills are available.", width));
+        lines.push(String::new());
     }
     for (index, row) in rows[start..end].iter().enumerate() {
         let absolute = start + index;
@@ -150,26 +159,20 @@ pub(crate) fn view_lines(
             Some(SelectionMode::Manual) => '◎',
             None => '○',
         };
-        let installed = match row.installed_mode {
-            Some(EffectiveMode::Enable) => "installed: Agent + Human",
-            Some(EffectiveMode::Manual) => "installed: Human",
-            Some(EffectiveMode::Dependency) => "installed: Agent dependency",
-            None => "not installed",
-        };
-        let ignored = if selection.is_some_and(SkillSelection::gitignore) {
-            " · ignored"
+        let status = if row.read_only {
+            "STALE"
         } else {
-            ""
+            row.sync.map_or("NOT INSTALLED", |status| status.label())
         };
         lines.push(fit(
             &format!(
-                "{} {mark} ${}:{} → {} · {installed}{ignored}{}",
+                "{}  {mark}    {status:<12} ${}:{} → {}{}",
                 if absolute == selected { '›' } else { ' ' },
                 row.scope,
                 row.name,
                 row.installed_name,
-                if row.read_only {
-                    " · stale/read-only"
+                if selection.is_some_and(SkillSelection::gitignore) {
+                    " · ignored"
                 } else {
                     ""
                 },
@@ -186,14 +189,50 @@ pub(crate) fn view_lines(
             Some(SelectionMode::Manual) => "Human",
             None => "Off",
         };
+        let effective = match row.installed_mode {
+            Some(EffectiveMode::Enable) => "Agent + Human",
+            Some(EffectiveMode::Manual) => "Human",
+            Some(EffectiveMode::Dependency) => "Agent dependency",
+            None => "not installed",
+        };
+        let guide = row.authoring.as_deref().map_or("", |path| {
+            if matches!(
+                row.sync,
+                Some(
+                    crate::installer::ProjectionStatus::KeepLocal
+                        | crate::installer::ProjectionStatus::Conflict
+                        | crate::installer::ProjectionStatus::OrphanedLocal
+                )
+            ) {
+                path
+            } else {
+                ""
+            }
+        });
         lines.push(fit(
-            &format!("  {mode} selection · {}", row.description),
+            &format!(
+                "  {mode} · {effective} · {}{}",
+                row.description,
+                if guide.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · promote via {guide}")
+                }
+            ),
             width,
         ));
     }
-    let ignore_hint = if global_scope { "" } else { "  i ignore" };
+    let actions = rows.get(selected).map_or("", |row| {
+        if !row_editable(row) {
+            ""
+        } else if global_scope {
+            "  Space mode"
+        } else {
+            "  Space mode  i Git-ignore"
+        }
+    });
     lines.push(fit(
-        &format!("  ↑↓ navigate  Space mode{ignore_hint}  s/Enter save  q/Esc cancel"),
+        &format!("  ↑↓ navigate{actions}  Enter save  Esc cancel"),
         width,
     ));
     lines.truncate(height);
@@ -243,7 +282,6 @@ mod tests {
             name: name.to_owned(),
             installed_name: name.to_owned(),
             description: format!("Configure {name}"),
-            global: true,
             selected: None,
             gitignore: false,
             installed,
@@ -251,6 +289,8 @@ mod tests {
             required_by: Vec::new(),
             read_only: false,
             status: None,
+            sync: None,
+            authoring: None,
         }
     }
 
@@ -268,10 +308,11 @@ mod tests {
         cycle_selection(&mut manifest, "pyg/develop");
         let lines = view_lines(&rows, &manifest, true, 0, 52, 10);
         assert!(lines.iter().any(|line| line.contains("pyg / engineering")));
+        assert!(lines.iter().any(|line| line.contains('●')));
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("● $engineering:develop"))
+                .any(|line| line.contains("$engineering:develop"))
         );
         assert!(lines.iter().any(|line| line.contains("Agent + Human")));
         assert!(lines.iter().all(|line| {
@@ -280,6 +321,19 @@ mod tests {
                 .sum::<usize>()
                 <= 52
         }));
+    }
+
+    #[test]
+    fn divergent_project_rows_show_status_and_no_mutation_hint() {
+        let mut divergent = row("develop", "engineering", true);
+        divergent.sync = Some(crate::installer::ProjectionStatus::KeepLocal);
+        divergent.authoring = Some("/catalog/skills/develop".to_owned());
+        let lines = view_lines(&[divergent], &ProjectConfig::default(), false, 0, 100, 9);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("KEEP LOCAL"));
+        assert!(rendered.contains("promote via /catalog/skills/develop"));
+        assert!(!rendered.contains("Space mode"));
+        assert!(!rendered.contains("Git-ignore"));
     }
 
     #[test]

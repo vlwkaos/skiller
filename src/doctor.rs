@@ -7,12 +7,12 @@ use serde::Serialize;
 
 use crate::catalog::{
     CatalogAvailability, CatalogIndex, CatalogStatus, load_global_config, resolve_rename,
-    sync_registered_catalogs_resilient,
+    sync_registered_catalogs_cached,
 };
 use crate::installer::{
-    InstallScope, TransactionJournal, TransactionPhase, install_paths,
+    InstallScope, ProjectionStatus, TransactionJournal, TransactionPhase, install_paths,
     install_with_catalogs_recovery, list_agent_skill_names, manifest_fingerprint, projection_roots,
-    resolve_manifest, validate_agents, validate_owned_state,
+    projection_status, resolve_manifest, validate_agents, validate_owned_state,
 };
 use crate::model::{
     INSTALLED_STATE_VERSION, InstalledState, ProjectConfig, validate_installed_state,
@@ -35,9 +35,10 @@ struct DoctorIssue {
 #[serde(rename_all = "camelCase")]
 struct DoctorReport<'a> {
     scope: &'a str,
-    healthy: bool,
+    ok: bool,
     issues: &'a [DoctorIssue],
-    catalog_status: &'a [DoctorCatalogStatus],
+    #[serde(skip_serializing_if = "<[DoctorCatalogStatus]>::is_empty")]
+    warnings: &'a [DoctorCatalogStatus],
 }
 
 #[derive(Serialize)]
@@ -63,7 +64,7 @@ struct Inputs {
 }
 
 // ^ README.md#doctor-and-recovery defines the read-only and explicit-repair boundary.
-pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<()> {
+pub fn run(scope: InstallScope, machine: bool, repair: bool, yes: bool) -> Result<()> {
     let scope_name = if scope.is_global() {
         "global"
     } else {
@@ -77,7 +78,7 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
                 message: format!("{error:#}"),
                 fixable: false,
             }];
-            print_report(scope_name, &issues, &[], print)?;
+            print_report(scope_name, &issues, &[], machine)?;
             if repair {
                 bail!("Doctor cannot repair invalid configuration or catalog data");
             }
@@ -259,14 +260,38 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
                 continue;
             }
             match desired_by_key.get(key.as_str()) {
-                None => issues.push(DoctorIssue {
-                    code: "obsolete-owned-skill",
-                    message: format!(
-                        "owned skill {} ({key}) is no longer desired",
-                        installed.installed_name
-                    ),
-                    fixable: true,
-                }),
+                None => {
+                    let actual = paths
+                        .command_root
+                        .join(".agents/skills")
+                        .join(&installed.installed_name);
+                    let local = !scope.is_global()
+                        && matches!(
+                            projection_status(false, installed, None, &actual)?,
+                            ProjectionStatus::KeepLocal
+                                | ProjectionStatus::Conflict
+                                | ProjectionStatus::Unknown
+                        );
+                    issues.push(DoctorIssue {
+                        code: if local {
+                            "orphaned-local"
+                        } else {
+                            "obsolete-owned-skill"
+                        },
+                        message: if local {
+                            format!(
+                                "{key} was removed from the catalog but has project changes; keeping {} unchanged",
+                                installed.installed_name
+                            )
+                        } else {
+                            format!(
+                                "owned skill {} ({key}) is no longer desired",
+                                installed.installed_name
+                            )
+                        },
+                        fixable: !local,
+                    });
+                }
                 Some(desired)
                     if desired.installed_name != installed.installed_name
                         || desired.mode != installed.mode
@@ -286,6 +311,36 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
                     });
                 }
                 Some(_) => {}
+            }
+            if !scope.is_global()
+                && let Some(desired) = desired_by_key.get(key.as_str())
+            {
+                let actual = paths
+                    .command_root
+                    .join(".agents/skills")
+                    .join(&installed.installed_name);
+                match projection_status(false, installed, Some(desired), &actual)? {
+                    ProjectionStatus::KeepLocal => issues.push(DoctorIssue {
+                        code: "project-override",
+                        message: format!(
+                            "{key} has project changes and is being kept unchanged"
+                        ),
+                        fixable: false,
+                    }),
+                    ProjectionStatus::Conflict => issues.push(DoctorIssue {
+                        code: "project-conflict",
+                        message: format!(
+                            "{key} has both project and catalog changes; merge or promote it manually"
+                        ),
+                        fixable: false,
+                    }),
+                    ProjectionStatus::Unknown => issues.push(DoctorIssue {
+                        code: "project-baseline",
+                        message: format!("{key} needs a schema-4 project content baseline"),
+                        fixable: true,
+                    }),
+                    _ => {}
+                }
             }
         }
         for desired in resolved {
@@ -360,7 +415,7 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
 
     deduplicate_issues(&mut issues);
     let catalog_status = doctor_catalog_statuses(&inputs, &state);
-    print_report(scope_name, &issues, &catalog_status, print)?;
+    print_report(scope_name, &issues, &catalog_status, machine)?;
     if !repair || issues.is_empty() {
         return Ok(());
     }
@@ -402,9 +457,9 @@ pub fn run(scope: InstallScope, print: bool, repair: bool, yes: bool) -> Result<
 fn load_inputs(scope: &InstallScope) -> Result<Inputs> {
     let global_config = load_global_config()?;
     if global_config.catalogs.is_empty() {
-        bail!("no catalogs configured; run `skiller add-catalog <alias> <source>`");
+        bail!("no catalogs configured; run `skiller catalog configure <alias> <source>`");
     }
-    let sync = sync_registered_catalogs_resilient(&global_config)?;
+    let sync = sync_registered_catalogs_cached(&global_config)?;
     let unavailable_aliases = sync.unavailable_aliases();
     let catalogs = sync.catalogs;
     let (config_path, mut manifest) = match scope {
@@ -657,6 +712,7 @@ fn doctor_catalog_statuses(inputs: &Inputs, state: &InstalledState) -> Vec<Docto
     inputs
         .statuses
         .values()
+        .filter(|status| status.availability != CatalogAvailability::Available)
         .map(|status| DoctorCatalogStatus {
             alias: status.alias.clone(),
             availability: match status.availability {
@@ -691,9 +747,9 @@ fn print_report(
             "{}",
             serde_json::to_string(&DoctorReport {
                 scope,
-                healthy: issues.is_empty(),
+                ok: issues.is_empty(),
                 issues,
-                catalog_status,
+                warnings: catalog_status,
             })?
         );
     } else if issues.is_empty() {
@@ -741,7 +797,6 @@ mod tests {
             alias: "pyg".to_owned(),
             source: "test".to_owned(),
             root: PathBuf::from("."),
-            revision: None,
             metadata: CatalogMetadata {
                 version: SCHEMA_VERSION,
                 scopes: BTreeMap::new(),
@@ -797,6 +852,7 @@ mod tests {
                     mode: crate::model::EffectiveMode::Enable,
                     gitignore: false,
                     digest: None,
+                    content_digest: None,
                     legacy_path: None,
                 },
             )]),

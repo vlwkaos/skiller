@@ -28,14 +28,6 @@ pub fn apply_invocation_mode(skill_root: &Path, mode: EffectiveMode) -> Result<(
     )
 }
 
-pub fn set_skill_name(skill_root: &Path, name: &str) -> Result<()> {
-    let skill_md = skill_root.join("SKILL.md");
-    let raw = std::fs::read_to_string(&skill_md)
-        .with_context(|| format!("reading {}", skill_md.display()))?;
-    let updated = set_frontmatter_field(&raw, "name", Some(name))?;
-    std::fs::write(&skill_md, updated).with_context(|| format!("writing {}", skill_md.display()))
-}
-
 pub fn apply_projected_identity(
     skill_root: &Path,
     installed_name: &str,
