@@ -15,7 +15,7 @@ skiller doctor [-g] [--repair [--yes]]
 
 `STATE` is `enable`, `manual`, `enable-ignored`, `manual-ignored`, or `off`. Project is the safe default for new catalog skills; `--global` is explicit.
 
-Read-only commands choose output automatically. A TTY gets the organized interactive or human view. A pipe, agent, or subprocess gets compact one-line JSON. `config` and `doctor` use synchronized cache only; `update` and `install` own remote refresh.
+Read-only commands choose output automatically. A TTY gets the organized interactive or human view with semantic color and status icons; `NO_COLOR` and `TERM=dumb` disable styling. A pipe, agent, or subprocess gets compact one-line JSON where supported and plain output otherwise. `config` and `doctor` use synchronized cache only; `update` and `install` own remote refresh. Global `update` checks the stable Skiller release without blocking skill results when the registry is unavailable, and reports a newer binary without installing it.
 
 ## Configuration
 
@@ -41,6 +41,8 @@ Global configuration is `~/.config/skiller/config.json`. Project configuration i
 
 Canonical `source` and optional `ref` own consumer content. `authoring_root` is an optional writable checkout used for guidance and unpublished-draft checks. Installation always uses canonical content.
 
+Interactive configuration restores the pre-Skiller selector geometry. Wide terminals keep scope navigation, compact one-line skill/configuration rows, and selected description, required-by, installed, and sync details visible in three columns. Enter moves focus from scopes to skills; Escape moves back. Narrow terminals retain the same scope-first navigation and stack only the selected skill's labeled details. Semantic scope, mode, warning, error, focus, and hint colors remain stable and respect `NO_COLOR` and `TERM=dumb`. Redraws queue one synchronized frame and replace rows in place instead of blanking the alternate screen.
+
 Enabled skills allow agent and human invocation. Manual skills are human-only unless required. Unselected dependencies are agent-only. Dependency reachability never changes configured selection.
 
 ## Project reconciliation
@@ -62,6 +64,10 @@ Config JSON and the TUI show the sync state and validated authoring skill path. 
 `skiller.json` declares semantic scopes, eligibility, and renames. Dependencies use comma-separated `metadata.skiller.requires`. Missing dependencies, cycles, invalid rename chains, eligibility mismatches, symlinks, and installed-name collisions are hard errors.
 
 `catalog add-skill` resolves the alias's validated authoring checkout. It no longer accepts an arbitrary catalog root. Legacy migration uses the bundled `skiller-migrate` guidance with normal catalog, config, and install commands.
+
+## Doctor and recovery
+
+`skiller doctor [-g]` is read-only. Its human report maps diagnosed catalog freshness, projection drift, and owned-state problems to explicit `update`, `install`, or `doctor --repair` suggestions without prompting or mutating. Non-TTY Doctor JSON remains stable and does not include presentation-only recommendations. Repair still requires `--repair` and confirmation unless `--yes` is supplied.
 
 ## Safety
 

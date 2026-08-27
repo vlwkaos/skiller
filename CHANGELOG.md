@@ -1,3 +1,14 @@
+## [0.10.0] - 2026-08-27
+
+### Features
+
+- Restore the pre-Skiller wide selector geometry with persistent scope, one-line skill/configuration, and selected-detail columns for descriptions, required relationships, installed state, and sync status.
+- Add stable semantic scope, mode, focus, warning, error, and hint colors plus contextual bracketed key hints for each navigation level.
+- Eliminate configuration flicker by queuing in-place row replacement as one synchronized terminal frame instead of clearing and incrementally repainting the screen.
+- Add diagnosis-specific Doctor recommendations without changing non-TTY JSON or prompting during read-only checks.
+- Distinguish install, update, and Doctor headings, progress, success, warning, and blocker output with TTY-only semantic color and icons.
+- Report newer stable Skiller binaries through global human and machine update checks without installing them or blocking skill updates when the registry is unavailable.
+
 ## [0.9.1] - 2026-08-26
 
 ### Changed

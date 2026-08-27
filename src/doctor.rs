@@ -740,9 +740,9 @@ fn print_report(
     scope: &str,
     issues: &[DoctorIssue],
     catalog_status: &[DoctorCatalogStatus],
-    print: bool,
+    machine: bool,
 ) -> Result<()> {
-    if print {
+    if machine {
         println!(
             "{}",
             serde_json::to_string(&DoctorReport {
@@ -752,20 +752,95 @@ fn print_report(
                 warnings: catalog_status,
             })?
         );
-    } else if issues.is_empty() {
-        println!("{scope} Skiller state is healthy");
+        return Ok(());
+    }
+
+    let output = crate::output::HumanOutput::stdout();
+    if issues.is_empty() {
+        println!(
+            "{}",
+            output.success(&format!("{scope} Skiller state is healthy"))
+        );
     } else {
-        println!("{scope} Skiller state has {} issue(s):", issues.len());
+        println!(
+            "{}",
+            output.heading(&format!("{scope} diagnosis · {} issue(s)", issues.len()))
+        );
         for issue in issues {
-            println!(
-                "- [{}] {}{}",
+            let message = format!(
+                "[{}] {}{}",
                 issue.code,
                 issue.message,
                 if issue.fixable { " [repairable]" } else { "" }
             );
+            println!(
+                "{}",
+                if issue.fixable {
+                    output.warning(&message)
+                } else {
+                    output.error(&message)
+                }
+            );
+        }
+    }
+    for status in catalog_status {
+        println!(
+            "{}",
+            output.warning(&format!(
+                "catalog {} is {}{}",
+                status.alias,
+                status.availability,
+                status
+                    .warning
+                    .as_deref()
+                    .map_or(String::new(), |warning| format!(": {warning}"))
+            ))
+        );
+    }
+    let recommendations = recommendation_commands(scope, issues, catalog_status);
+    if !recommendations.is_empty() {
+        println!("{}", output.heading("Recommended next steps"));
+        for recommendation in recommendations {
+            println!("{}", output.info(&recommendation));
         }
     }
     Ok(())
+}
+
+fn recommendation_commands(
+    scope: &str,
+    issues: &[DoctorIssue],
+    catalog_status: &[DoctorCatalogStatus],
+) -> Vec<String> {
+    let scope_flag = if scope == "global" { " -g" } else { "" };
+    let mut recommendations = Vec::new();
+    let update_codes = ["update-available"];
+    let install_codes = ["missing-owned-skill", "ownership-drift", "projection-drift"];
+    if !catalog_status.is_empty()
+        || issues
+            .iter()
+            .any(|issue| update_codes.contains(&issue.code))
+    {
+        recommendations.push(format!(
+            "Run `skiller update{scope_flag}` to refresh and review catalog updates."
+        ));
+    }
+    if issues
+        .iter()
+        .any(|issue| install_codes.contains(&issue.code))
+    {
+        recommendations.push(format!(
+            "Run `skiller install{scope_flag}` to reconcile desired projections."
+        ));
+    }
+    if issues.iter().any(|issue| {
+        issue.fixable && !update_codes.contains(&issue.code) && !install_codes.contains(&issue.code)
+    }) {
+        recommendations.push(format!(
+            "Run `skiller doctor{scope_flag} --repair` to repair Skiller-owned state."
+        ));
+    }
+    recommendations
 }
 
 fn confirm(scope: &str, issue_count: usize) -> Result<bool> {
@@ -946,6 +1021,51 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("converge")
+        );
+    }
+
+    #[test]
+    fn diagnosis_recommends_commands_without_mutating_or_prompting() {
+        let issues = vec![
+            DoctorIssue {
+                code: "update-available",
+                message: "published change".to_owned(),
+                fixable: true,
+            },
+            DoctorIssue {
+                code: "projection-drift",
+                message: "missing projection".to_owned(),
+                fixable: true,
+            },
+            DoctorIssue {
+                code: "staging-residue",
+                message: "residue".to_owned(),
+                fixable: true,
+            },
+        ];
+        assert_eq!(
+            recommendation_commands("global", &issues, &[]),
+            vec![
+                "Run `skiller update -g` to refresh and review catalog updates.",
+                "Run `skiller install -g` to reconcile desired projections.",
+                "Run `skiller doctor -g --repair` to repair Skiller-owned state.",
+            ]
+        );
+    }
+
+    #[test]
+    fn unavailable_catalog_recommends_update_without_changing_json_contract() {
+        let status = DoctorCatalogStatus {
+            alias: "offline".to_owned(),
+            availability: "unavailable",
+            stale: false,
+            declared_count: 1,
+            installed_count: 1,
+            warning: Some("network unavailable".to_owned()),
+        };
+        assert_eq!(
+            recommendation_commands("project", &[], &[status]),
+            vec!["Run `skiller update` to refresh and review catalog updates."]
         );
     }
 

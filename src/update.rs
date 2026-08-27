@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
+use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -10,7 +12,7 @@ use crate::catalog::{
 };
 use crate::installer::{InstallScope, install_paths, resolve_manifest};
 use crate::model::{InstalledState, ProjectConfig};
-use crate::paths::{read_json, read_json_or_default};
+use crate::paths::{output_bounded, read_json, read_json_or_default};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,6 +32,15 @@ struct UpdateReport {
     drafts: Vec<SkillUpdate>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<UpdateCatalogStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release: Option<ReleaseUpdate>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseUpdate {
+    installed_version: &'static str,
+    available_version: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,8 +59,70 @@ struct UpdateCatalogStatus {
     draft_warning: Option<String>,
 }
 
+fn version_parts(value: &str) -> Option<[u64; 3]> {
+    let values = value
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    match values.as_slice() {
+        [major, minor, patch] => Some([*major, *minor, *patch]),
+        _ => None,
+    }
+}
+
+fn parse_registry_version(raw: &str) -> Option<String> {
+    if raw.len() > 4_096 {
+        return None;
+    }
+    let version = raw.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("skiller = \"")?
+            .split('"')
+            .next()
+    })?;
+    version_parts(version)?;
+    Some(version.to_owned())
+}
+
+fn release_from_registry(
+    installed_version: &'static str,
+    registry_output: &str,
+) -> Option<ReleaseUpdate> {
+    let available_version = parse_registry_version(registry_output)?;
+    (version_parts(&available_version)? > version_parts(installed_version)?).then_some(
+        ReleaseUpdate {
+            installed_version,
+            available_version,
+        },
+    )
+}
+
+fn release_update() -> Option<ReleaseUpdate> {
+    let mut command = Command::new("cargo");
+    command.args(["search", "skiller", "--limit", "1"]);
+    let (status, stdout, _) = output_bounded(
+        &mut command,
+        "checking the Skiller release",
+        Duration::from_secs(8),
+    )
+    .ok()?;
+    if !status.success() {
+        return None;
+    }
+    release_from_registry(
+        env!("CARGO_PKG_VERSION"),
+        std::str::from_utf8(&stdout).ok()?,
+    )
+}
+
 pub fn run(scope: InstallScope, machine: bool, yes: bool) -> Result<()> {
     let global = load_global_config()?;
+    let release_check = scope
+        .is_global()
+        .then(|| std::thread::spawn(release_update));
+    let output = crate::output::HumanOutput::stdout();
+    let error_output = crate::output::HumanOutput::stderr();
     let sync = sync_registered_catalogs_resilient(&global)?;
     for status in sync
         .statuses
@@ -57,9 +130,12 @@ pub fn run(scope: InstallScope, machine: bool, yes: bool) -> Result<()> {
         .filter(|status| status.warning.is_some())
     {
         eprintln!(
-            "warning: catalog {} is unavailable: {}",
-            status.alias,
-            status.warning.as_deref().unwrap_or_default()
+            "{}",
+            error_output.warning(&format!(
+                "catalog {} is unavailable: {}",
+                status.alias,
+                status.warning.as_deref().unwrap_or_default()
+            ))
         );
     }
     let unavailable_aliases = sync.unavailable_aliases();
@@ -126,30 +202,52 @@ pub fn run(scope: InstallScope, machine: bool, yes: bool) -> Result<()> {
         updates,
         drafts,
         warnings,
+        release: release_check.and_then(|check| check.join().ok().flatten()),
     };
     if machine {
         println!("{}", serde_json::to_string(&report)?);
-    } else if report.updates.is_empty() && report.drafts.is_empty() {
-        println!("{} skills are current", report.scope);
+    } else if report.updates.is_empty() && report.drafts.is_empty() && report.release.is_none() {
+        println!(
+            "{}",
+            output.success(&format!("{} skills are current", report.scope))
+        );
     } else {
+        if let Some(release) = &report.release {
+            println!(
+                "{}",
+                output.info(&format!(
+                    "Skiller {} is available (installed {}). Update it through the package manager that installed Skiller.",
+                    release.available_version, release.installed_version
+                ))
+            );
+        }
         if !report.updates.is_empty() {
             println!(
-                "{} published skill update{} available:",
-                report.updates.len(),
-                if report.updates.len() == 1 { "" } else { "s" }
+                "{}",
+                output.heading(&format!(
+                    "Published updates · {} skill{}",
+                    report.updates.len(),
+                    if report.updates.len() == 1 { "" } else { "s" }
+                ))
             );
             for update in &report.updates {
-                println!("- {} ({})", update.key, update.status);
+                println!(
+                    "{}",
+                    output.item(&format!("{}  {}", update.key, update.status))
+                );
             }
         }
         if !report.drafts.is_empty() {
             println!(
-                "{} unpublished authoring change{} detected:",
-                report.drafts.len(),
-                if report.drafts.len() == 1 { "" } else { "s" }
+                "{}",
+                output.heading(&format!(
+                    "Unpublished authoring changes · {} skill{}",
+                    report.drafts.len(),
+                    if report.drafts.len() == 1 { "" } else { "s" }
+                ))
             );
             for update in &report.drafts {
-                println!("- {}", update.key);
+                println!("{}", output.warning(&update.key));
             }
         }
     }
@@ -157,7 +255,7 @@ pub fn run(scope: InstallScope, machine: bool, yes: bool) -> Result<()> {
         return Ok(());
     }
     if !yes && !confirm(report.updates.len())? {
-        println!("update cancelled");
+        println!("{}", output.info("update cancelled"));
         return Ok(());
     }
     drop(resolved);
@@ -266,6 +364,24 @@ mod tests {
     use super::*;
     use crate::catalog::{CatalogAvailability, CatalogStatus};
     use crate::model::{EffectiveMode, InstalledSkill};
+
+    #[test]
+    fn release_versions_are_exact_and_ordered() {
+        assert_eq!(version_parts("0.10.0"), Some([0, 10, 0]));
+        assert_eq!(version_parts("0.10"), None);
+        assert_eq!(version_parts("0.10.0-beta.1"), None);
+        assert_eq!(
+            parse_registry_version("skiller = \"0.11.0\" # registry"),
+            Some("0.11.0".to_owned())
+        );
+        assert_eq!(parse_registry_version("other = \"9.0.0\""), None);
+        assert_eq!(parse_registry_version(&"x".repeat(4_097)), None);
+        let release = release_from_registry("0.10.0", "skiller = \"0.11.0\"").unwrap();
+        assert_eq!(release.installed_version, "0.10.0");
+        assert_eq!(release.available_version, "0.11.0");
+        assert!(release_from_registry("0.10.0", "skiller = \"0.10.0\"").is_none());
+        assert!(release_from_registry("0.10.0", "skiller = \"0.9.1\"").is_none());
+    }
 
     #[test]
     fn unavailable_catalog_is_reported_without_an_update() {

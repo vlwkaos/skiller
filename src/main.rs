@@ -5,6 +5,7 @@ mod doctor;
 mod installer;
 mod manual;
 mod model;
+mod output;
 mod paths;
 mod update;
 

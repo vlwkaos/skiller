@@ -112,6 +112,8 @@ struct ReconcileSelection {
 }
 
 pub fn install(scope: InstallScope) -> Result<()> {
+    let output = crate::output::HumanOutput::stdout();
+    let error_output = crate::output::HumanOutput::stderr();
     let global_config = load_global_config()?;
     let sync = sync_registered_catalogs_resilient(&global_config)?;
     for status in sync
@@ -120,9 +122,12 @@ pub fn install(scope: InstallScope) -> Result<()> {
         .filter(|status| status.warning.is_some())
     {
         eprintln!(
-            "warning: catalog {} is unavailable: {}",
-            status.alias,
-            status.warning.as_deref().unwrap_or_default()
+            "{}",
+            error_output.warning(&format!(
+                "catalog {} is unavailable: {}",
+                status.alias,
+                status.warning.as_deref().unwrap_or_default()
+            ))
         );
     }
     let unavailable_aliases = sync.unavailable_aliases();
@@ -167,7 +172,7 @@ pub fn install(scope: InstallScope) -> Result<()> {
             }
         }
         for message in messages {
-            println!("repaired: {message}");
+            println!("{}", output.success(&format!("Repaired · {message}")));
         }
     }
     install_with_catalogs_preserving(scope, &migrated, &catalogs, &unavailable_aliases)
@@ -199,6 +204,7 @@ pub(crate) fn install_with_catalogs_recovery(
     recovering: bool,
     unavailable_aliases: &BTreeSet<String>,
 ) -> Result<()> {
+    let output = crate::output::HumanOutput::stdout();
     validate_schema(manifest.version, "skill config")?;
     validate_agents(&manifest.agents)?;
     let paths = install_paths(&scope)?;
@@ -245,7 +251,10 @@ pub(crate) fn install_with_catalogs_recovery(
         effective_replacement_owned.extend(journal.desired.iter().cloned());
         effective_replacement_owned.extend(journal.remove.iter().cloned());
         effective_recovering = true;
-        println!("recovery: resuming a validated interrupted installation");
+        println!(
+            "{}",
+            output.info("Recovery · resuming a validated interrupted installation")
+        );
     }
     let preserved: BTreeMap<_, _> = previous
         .skills
@@ -270,11 +279,17 @@ pub(crate) fn install_with_catalogs_recovery(
     let environment_issues = preflight_environment(&paths, scope.is_global())?;
     if !environment_issues.is_empty() {
         println!(
-            "install preflight found {} environment issue(s):",
-            environment_issues.len()
+            "{}",
+            output.error(&format!(
+                "Install preflight · {} environment issue(s)",
+                environment_issues.len()
+            ))
         );
         for issue in &environment_issues {
-            println!("- [environment-permission] {issue}");
+            println!(
+                "{}",
+                output.item(&format!("[environment-permission] {issue}"))
+            );
         }
         bail!("install preflight failed before projection mutation");
     }
@@ -336,7 +351,7 @@ pub(crate) fn install_with_catalogs_recovery(
             .chain(cleanup_owned.iter().cloned())
             .collect();
         for notice in &selection.notices {
-            println!("- {notice}");
+            println!("{}", output.warning(notice));
         }
         let mut complete_names = selection.complete_names;
         if !eligible.is_empty() || !removed.is_empty() {
@@ -443,9 +458,12 @@ pub(crate) fn install_with_catalogs_recovery(
     prepared_cleanup?;
     stable_prepared_cleanup?;
     if !issues.is_empty() {
-        println!("install made maximal safe progress; Doctor summary:");
+        println!(
+            "{}",
+            output.error("Install made maximal safe progress · remaining blockers")
+        );
         for issue in &issues {
-            println!("- {issue}");
+            println!("{}", output.item(issue));
         }
         bail!("install remains incomplete for {} item(s)", issues.len());
     }
@@ -460,7 +478,24 @@ pub(crate) fn install_with_catalogs_recovery(
         .count();
     if !changed {
         println!(
-            "{} managed {} skill{} already converged",
+            "{}",
+            output.success(&format!(
+                "{} managed {} skill{} already converged",
+                resolved.len(),
+                if scope.is_global() {
+                    "global"
+                } else {
+                    "project"
+                },
+                if resolved.len() == 1 { "" } else { "s" }
+            ))
+        );
+        return Ok(());
+    }
+    println!(
+        "{}",
+        output.success(&format!(
+            "Reconciled {} managed {} skill{} through Vercel Skills",
             resolved.len(),
             if scope.is_global() {
                 "global"
@@ -468,27 +503,18 @@ pub(crate) fn install_with_catalogs_recovery(
                 "project"
             },
             if resolved.len() == 1 { "" } else { "s" }
-        );
-        return Ok(());
-    }
-    println!(
-        "reconciled {} managed {} skill{} through Vercel Skills",
-        resolved.len(),
-        if scope.is_global() {
-            "global"
-        } else {
-            "project"
-        },
-        if resolved.len() == 1 { "" } else { "s" }
+        ))
     );
     if manual_count > 0 {
         println!(
-            "warning: manual mode is enforced by Pi, Claude Code, Cursor, and Codex; OpenCode and Gemini CLI may still expose these skills to the model"
+            "{}",
+            output.warning("Manual mode is enforced by Pi, Claude Code, Cursor, and Codex; OpenCode and Gemini CLI may still expose these skills to the model")
         );
     }
     if dependency_count > 0 {
         println!(
-            "warning: dependency-only user hiding is enforced by Claude Code and Pygmalion; other agents may expose exact invocation"
+            "{}",
+            output.warning("Dependency-only user hiding is enforced by Claude Code and Pygmalion; other agents may expose exact invocation")
         );
     }
     Ok(())
