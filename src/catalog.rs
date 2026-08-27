@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -24,6 +24,12 @@ pub struct CatalogIndex {
     pub skills: BTreeMap<String, CatalogSkill>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CatalogRecommendation {
+    pub files: Vec<String>,
+    pub keywords: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CatalogSkill {
     pub name: String,
@@ -32,6 +38,7 @@ pub struct CatalogSkill {
     pub scope: Option<String>,
     pub installed_name: String,
     pub global: bool,
+    pub recommend: Option<CatalogRecommendation>,
     pub requires: Vec<String>,
 }
 
@@ -599,6 +606,47 @@ fn clone_candidates(source: &str) -> Vec<String> {
     }
 }
 
+const MAX_RECOMMENDATION_SIGNALS: usize = 32;
+const MAX_RECOMMENDATION_VALUE_BYTES: usize = 128;
+
+fn validate_recommendation(skill: &str, recommendation: &CatalogRecommendation) -> Result<()> {
+    if recommendation.files.is_empty() && recommendation.keywords.is_empty() {
+        bail!("skill {skill} has an empty recommendation");
+    }
+    if recommendation.files.len() + recommendation.keywords.len() > MAX_RECOMMENDATION_SIGNALS {
+        bail!("skill {skill} has too many recommendation signals");
+    }
+    let mut unique = BTreeSet::new();
+    for file in &recommendation.files {
+        let mut components = Path::new(file).components();
+        if file.is_empty()
+            || file.len() > MAX_RECOMMENDATION_VALUE_BYTES
+            || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+            || file.chars().any(char::is_control)
+        {
+            bail!("skill {skill} has invalid recommendation file {file:?}");
+        }
+        if !unique.insert(format!("file:{}", file.to_ascii_lowercase())) {
+            bail!("skill {skill} has duplicate recommendation file {file:?}");
+        }
+    }
+    for keyword in &recommendation.keywords {
+        if keyword.trim() != keyword
+            || keyword.is_empty()
+            || keyword.len() > MAX_RECOMMENDATION_VALUE_BYTES
+            || keyword.chars().any(char::is_control)
+        {
+            bail!("skill {skill} has invalid recommendation keyword {keyword:?}");
+        }
+        if !unique.insert(format!("keyword:{}", keyword.to_lowercase())) {
+            bail!("skill {skill} has duplicate recommendation keyword {keyword:?}");
+        }
+    }
+    Ok(())
+}
+
+// ^ README.md#catalog-recommendations owns the bounded declarative signal contract.
 pub(crate) fn scan_catalog(alias: &str, source: &str, root: &Path) -> Result<CatalogIndex> {
     let metadata_path = root.join("skiller.json");
     let metadata: CatalogMetadata = if metadata_path.exists() {
@@ -613,7 +661,6 @@ pub(crate) fn scan_catalog(alias: &str, source: &str, root: &Path) -> Result<Cat
             bail!("invalid scope name in {}: {scope}", metadata_path.display());
         }
     }
-
     let skills_root = root.join("skills");
     let entries = std::fs::read_dir(&skills_root).with_context(|| {
         format!(
@@ -689,16 +736,17 @@ fn read_skill_directory(directory: &Path, metadata: CatalogSkillMetadata) -> Res
     }
     let description =
         scalar(frontmatter, "description").unwrap_or_else(|| "No description".to_owned());
-    let requires = nested_scalar(frontmatter, "skiller.requires")
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|dependency| !dependency.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
+    let requires = comma_values(frontmatter, "skiller.requires");
+    let recommendation = CatalogRecommendation {
+        files: comma_values(frontmatter, "skiller.recommend.files"),
+        keywords: comma_values(frontmatter, "skiller.recommend.keywords"),
+    };
+    let recommend = if recommendation.files.is_empty() && recommendation.keywords.is_empty() {
+        None
+    } else {
+        validate_recommendation(&name, &recommendation)?;
+        Some(recommendation)
+    };
     Ok(CatalogSkill {
         installed_name: installed_name(&name, metadata.scope.as_deref())?,
         digest: directory_digest(directory)?,
@@ -706,6 +754,7 @@ fn read_skill_directory(directory: &Path, metadata: CatalogSkillMetadata) -> Res
         description,
         scope: metadata.scope,
         global: metadata.global,
+        recommend,
         requires,
     })
 }
@@ -783,6 +832,19 @@ fn scalar(frontmatter: &str, key: &str) -> Option<String> {
         }
         scalar_value(&lines, index, value)
     })
+}
+
+fn comma_values(frontmatter: &str, key: &str) -> Vec<String> {
+    nested_scalar(frontmatter, key)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn nested_scalar(frontmatter: &str, key: &str) -> Option<String> {
@@ -963,11 +1025,19 @@ mod tests {
     }
 
     #[test]
-    fn nested_skiller_dependency_string_is_parsed() {
-        let frontmatter = "name: develop\nmetadata:\n  skiller.requires: \"recall,simplify\"\n";
+    fn nested_skiller_metadata_strings_are_parsed() {
+        let frontmatter = "name: develop\nmetadata:\n  skiller.requires: \"recall,simplify\"\n  skiller.recommend.files: Cargo.toml\n  skiller.recommend.keywords: \"release,Homebrew\"\n";
         assert_eq!(
-            nested_scalar(frontmatter, "skiller.requires").as_deref(),
-            Some("recall,simplify")
+            comma_values(frontmatter, "skiller.requires"),
+            ["recall", "simplify"]
+        );
+        assert_eq!(
+            comma_values(frontmatter, "skiller.recommend.files"),
+            ["Cargo.toml"]
+        );
+        assert_eq!(
+            comma_values(frontmatter, "skiller.recommend.keywords"),
+            ["release", "Homebrew"]
         );
     }
 
@@ -980,6 +1050,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recommendation_metadata_is_bounded_and_path_safe() {
+        validate_recommendation(
+            "rust-release",
+            &CatalogRecommendation {
+                files: vec!["Cargo.toml".to_owned()],
+                keywords: vec!["release".to_owned(), "Homebrew".to_owned()],
+            },
+        )
+        .unwrap();
+        for invalid in [
+            CatalogRecommendation::default(),
+            CatalogRecommendation {
+                files: vec!["../Cargo.toml".to_owned()],
+                keywords: Vec::new(),
+            },
+            CatalogRecommendation {
+                files: Vec::new(),
+                keywords: vec!["Vite".to_owned(), "vite".to_owned()],
+            },
+        ] {
+            assert!(validate_recommendation("invalid", &invalid).is_err());
+        }
+        let excessive = CatalogRecommendation {
+            files: Vec::new(),
+            keywords: (0..=MAX_RECOMMENDATION_SIGNALS)
+                .map(|index| format!("signal-{index}"))
+                .collect(),
+        };
+        assert!(validate_recommendation("invalid", &excessive).is_err());
+    }
+
     fn dependency_skill(name: &str, requires: &[&str]) -> CatalogSkill {
         CatalogSkill {
             name: name.to_owned(),
@@ -988,6 +1090,7 @@ mod tests {
             scope: None,
             installed_name: name.to_owned(),
             global: true,
+            recommend: None,
             requires: requires
                 .iter()
                 .map(|dependency| (*dependency).to_owned())

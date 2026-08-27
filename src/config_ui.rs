@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -43,6 +43,8 @@ pub(crate) struct ConfigRow {
     pub(crate) installed_mode: Option<EffectiveMode>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) required_by: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) recommended_by: Vec<String>,
     #[serde(skip_serializing_if = "is_false")]
     pub(crate) read_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +86,8 @@ struct PrintedSkill<'a> {
     installed_mode: Option<EffectiveMode>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     required_by: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    recommended_by: &'a Vec<String>,
     #[serde(skip_serializing_if = "is_false")]
     read_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,6 +119,7 @@ fn printed_skill(row: &ConfigRow) -> PrintedSkill<'_> {
         gitignore: row.gitignore,
         installed_mode: row.installed_mode,
         required_by: &row.required_by,
+        recommended_by: &row.recommended_by,
         read_only: row.read_only,
         status: row.status.as_deref(),
         sync: row.sync,
@@ -194,10 +199,18 @@ pub fn configure(
             display_catalogs.insert(alias.clone(), catalog.clone());
         }
     }
+    let requested_off: BTreeSet<_> = assignments
+        .iter()
+        .filter_map(|assignment| assignment.split_once('='))
+        .filter(|(_, state)| *state == "off")
+        .map(|(key, _)| key)
+        .collect();
     let mut active_manifest = manifest.clone();
     active_manifest.skills.retain(|key, _| {
-        key.split_once('/')
-            .is_some_and(|(alias, _)| catalogs.contains_key(alias))
+        !requested_off.contains(key.as_str())
+            && key
+                .split_once('/')
+                .is_some_and(|(alias, _)| catalogs.contains_key(alias))
     });
     let desired = resolve_manifest(&active_manifest, &catalogs, scope.is_global())?;
     let desired_by_key: BTreeMap<_, _> = desired
@@ -306,6 +319,97 @@ fn installed_name_is_current(installed: &crate::model::InstalledSkill, desired_n
     installed.installed_name == desired_name
 }
 
+const PROJECT_EVIDENCE_FILES: [&str; 5] = [
+    "package.json",
+    "pyproject.toml",
+    "Cargo.toml",
+    "README.md",
+    "AGENTS.md",
+];
+const MAX_PROJECT_ROOT_ENTRIES: usize = 4_096;
+const MAX_PROJECT_EVIDENCE_BYTES: u64 = 20_000;
+
+#[derive(Default)]
+struct ProjectEvidence {
+    files: BTreeSet<String>,
+    searchable: String,
+}
+
+fn project_evidence(root: &Path) -> ProjectEvidence {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return ProjectEvidence::default();
+    };
+    let mut evidence = ProjectEvidence::default();
+    for (index, entry) in entries.enumerate() {
+        if index == MAX_PROJECT_ROOT_ENTRIES {
+            return ProjectEvidence::default();
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        evidence.searchable.push_str(&name.to_lowercase());
+        evidence.searchable.push('\n');
+        evidence.files.insert(name);
+    }
+    for name in PROJECT_EVIDENCE_FILES {
+        if !evidence.files.contains(name) {
+            continue;
+        }
+        let path = root.join(name);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_PROJECT_EVIDENCE_BYTES)
+            .read_to_end(&mut bytes)
+            .is_ok()
+        {
+            evidence
+                .searchable
+                .push_str(&String::from_utf8_lossy(&bytes).to_lowercase());
+            evidence.searchable.push('\n');
+        }
+    }
+    evidence
+}
+
+fn recommendation_reasons(
+    recommendation: Option<&crate::catalog::CatalogRecommendation>,
+    evidence: &ProjectEvidence,
+) -> Vec<String> {
+    let Some(recommendation) = recommendation else {
+        return Vec::new();
+    };
+    let matched_files: Vec<_> = recommendation
+        .files
+        .iter()
+        .filter(|file| evidence.files.contains(file.as_str()))
+        .map(|file| format!("file {file}"))
+        .collect();
+    if !recommendation.files.is_empty() && matched_files.is_empty() {
+        return Vec::new();
+    }
+    let matched_keywords: Vec<_> = recommendation
+        .keywords
+        .iter()
+        .filter(|keyword| evidence.searchable.contains(&keyword.to_lowercase()))
+        .map(|keyword| format!("keyword {keyword}"))
+        .collect();
+    if !recommendation.keywords.is_empty() && matched_keywords.is_empty() {
+        return Vec::new();
+    }
+    matched_files.into_iter().chain(matched_keywords).collect()
+}
+
+// ^ README.md#catalog-recommendations owns evidence bounds and match semantics.
 fn config_rows(
     catalogs: &BTreeMap<String, CatalogIndex>,
     state: &InstalledState,
@@ -315,6 +419,7 @@ fn config_rows(
     desired: &BTreeMap<&str, &ResolvedSkill<'_>>,
     stale_aliases: &BTreeSet<String>,
 ) -> Result<Vec<ConfigRow>> {
+    let evidence = project_root.map(project_evidence).unwrap_or_default();
     let mut rows: Vec<_> = catalogs
         .values()
         .flat_map(|catalog| {
@@ -356,6 +461,7 @@ fn config_rows(
                         selected: selection.map(SkillSelection::mode),
                         gitignore: selection.is_some_and(SkillSelection::gitignore),
                         required_by,
+                        recommended_by: recommendation_reasons(skill.recommend.as_ref(), &evidence),
                         read_only: stale_aliases.contains(&catalog.alias),
                         status: stale_aliases
                             .contains(&catalog.alias)
@@ -399,6 +505,7 @@ fn config_rows(
                 installed: true,
                 installed_mode: Some(installed.mode),
                 required_by: Vec::new(),
+                recommended_by: Vec::new(),
                 read_only: true,
                 status: Some("orphaned".to_owned()),
                 sync: Some(ProjectionStatus::OrphanedLocal),
@@ -516,7 +623,7 @@ fn apply_assignments(
         let (key, state) = assignment.split_once('=').with_context(|| {
             format!("invalid selection {assignment:?}; expected catalog/name=STATE")
         })?;
-        if !available.contains(key) {
+        if !(available.contains(key) || state == "off" && manifest.skills.contains_key(key)) {
             anyhow::bail!("skill is unavailable in this configuration: {key}");
         }
         if !seen.insert(key) {
@@ -610,7 +717,7 @@ fn prompt(message: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::CatalogSkill;
+    use crate::catalog::{CatalogRecommendation, CatalogSkill};
     use crate::model::{CatalogMetadata, InstalledSkill, SCHEMA_VERSION};
     use std::path::PathBuf;
 
@@ -644,6 +751,7 @@ mod tests {
             installed: false,
             installed_mode: None,
             required_by: Vec::new(),
+            recommended_by: Vec::new(),
             read_only: false,
             status: None,
             sync: None,
@@ -696,6 +804,35 @@ mod tests {
                 &mut manifest,
                 &rows,
                 &["pyg/develop=enable-ignored".to_owned()],
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn off_can_remove_a_previously_selected_ineligible_skill() {
+        let mut manifest = ProjectConfig {
+            version: SCHEMA_VERSION,
+            skills: BTreeMap::from([(
+                "pyg/retired-global".to_owned(),
+                SkillSelection::Mode(SelectionMode::Manual),
+            )]),
+            agents: crate::model::default_agents(),
+        };
+        apply_assignments(
+            &mut manifest,
+            &[],
+            &["pyg/retired-global=off".to_owned()],
+            true,
+        )
+        .unwrap();
+        assert!(!manifest.skills.contains_key("pyg/retired-global"));
+        assert!(
+            apply_assignments(
+                &mut manifest,
+                &[],
+                &["pyg/never-selected=off".to_owned()],
                 true,
             )
             .is_err()
@@ -760,6 +897,71 @@ mod tests {
     }
 
     #[test]
+    fn project_recommendations_require_each_populated_signal_class() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/config-recommendations");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\n# release with Homebrew\n",
+        )
+        .unwrap();
+        let recommendation = CatalogRecommendation {
+            files: vec!["Cargo.toml".to_owned()],
+            keywords: vec!["release".to_owned(), "crates.io".to_owned()],
+        };
+        let catalog = CatalogIndex {
+            alias: "pyg".to_owned(),
+            source: "test".to_owned(),
+            root: PathBuf::from("."),
+            metadata: CatalogMetadata::default(),
+            skills: BTreeMap::from([(
+                "rust-release".to_owned(),
+                CatalogSkill {
+                    name: "rust-release".to_owned(),
+                    description: "Release Rust".to_owned(),
+                    digest: "rust-release".to_owned(),
+                    scope: Some("release".to_owned()),
+                    installed_name: "rust-release".to_owned(),
+                    global: false,
+                    recommend: Some(recommendation),
+                    requires: Vec::new(),
+                },
+            )]),
+        };
+        let rows = config_rows(
+            &BTreeMap::from([("pyg".to_owned(), catalog)]),
+            &InstalledState::default(),
+            &ProjectConfig::default(),
+            false,
+            Some(&root),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows[0].recommended_by,
+            vec!["file Cargo.toml", "keyword release"]
+        );
+        let printed = serde_json::to_value(printed_skill(&rows[0])).unwrap();
+        assert_eq!(
+            printed["recommendedBy"],
+            serde_json::json!(["file Cargo.toml", "keyword release"])
+        );
+
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        let evidence = project_evidence(&root);
+        let unmatched = CatalogRecommendation {
+            files: vec!["Cargo.toml".to_owned()],
+            keywords: vec!["release".to_owned()],
+        };
+        assert!(recommendation_reasons(Some(&unmatched), &evidence).is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn rows_partition_global_and_project_skills() {
         let catalog = CatalogIndex {
             alias: "pyg".to_owned(),
@@ -776,6 +978,7 @@ mod tests {
                         scope: None,
                         installed_name: "global-scope".to_owned(),
                         global: true,
+                        recommend: None,
                         requires: Vec::new(),
                     },
                 ),
@@ -788,6 +991,7 @@ mod tests {
                         scope: None,
                         installed_name: "project-scope".to_owned(),
                         global: false,
+                        recommend: None,
                         requires: Vec::new(),
                     },
                 ),

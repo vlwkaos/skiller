@@ -11,8 +11,9 @@ use crate::catalog::{
 };
 use crate::installer::{
     InstallScope, ProjectionStatus, TransactionJournal, TransactionPhase, install_paths,
-    install_with_catalogs_recovery, list_agent_skill_names, manifest_fingerprint, projection_roots,
-    projection_status, resolve_manifest, validate_agents, validate_owned_state,
+    install_with_catalogs_recovery, list_agent_skill_names, managed_project_lock_names,
+    manifest_fingerprint, projection_roots, projection_status, resolve_manifest, validate_agents,
+    validate_owned_state,
 };
 use crate::model::{
     INSTALLED_STATE_VERSION, InstalledState, ProjectConfig, validate_installed_state,
@@ -242,6 +243,33 @@ pub fn run(scope: InstallScope, machine: bool, repair: bool, yes: bool) -> Resul
         }
         (None, _) => None,
     };
+
+    if let InstallScope::Project(project_root) = &scope {
+        let mut owned_names: BTreeSet<_> = state
+            .skills
+            .values()
+            .map(|skill| skill.installed_name.clone())
+            .collect();
+        if let Some(authorized) = &journal_authorization {
+            owned_names.extend(authorized.iter().cloned());
+        }
+        match managed_project_lock_names(project_root, &owned_names) {
+            Ok(names) if !names.is_empty() => issues.push(DoctorIssue {
+                code: "catalog-lock-entry",
+                message: format!(
+                    "skills-lock.json contains Skiller-managed catalog entries: {}",
+                    names.into_iter().collect::<Vec<_>>().join(", ")
+                ),
+                fixable: true,
+            }),
+            Ok(_) => {}
+            Err(error) => issues.push(DoctorIssue {
+                code: "skills-lock",
+                message: error.to_string(),
+                fixable: false,
+            }),
+        }
+    }
 
     if let Some(resolved) = &resolved {
         let desired_by_key: BTreeMap<_, _> = resolved
@@ -893,6 +921,7 @@ mod tests {
                     scope: Some("learning".to_owned()),
                     installed_name: "learn".to_owned(),
                     global: true,
+                    recommend: None,
                     requires: Vec::new(),
                 },
             )]),

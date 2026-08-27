@@ -313,6 +313,9 @@ fn segment_color(segment: &str, state: ConfigTuiState) -> Option<Color> {
     if matches!(segment, "Details" | "Description" | "Installed") {
         return Some(crate::output::ACCENT);
     }
+    if segment == "Recommended" || segment.contains('★') {
+        return Some(crate::output::WARNING);
+    }
     if segment == "Required" || segment.contains("Required by") || segment.contains('↳') {
         return Some(crate::output::WARNING);
     }
@@ -346,7 +349,7 @@ fn is_heading(segment: &str) -> bool {
         || segment.starts_with("Skills")
         || matches!(
             segment,
-            "Details" | "Description" | "Required" | "Installed"
+            "Details" | "Description" | "Recommended" | "Required" | "Installed"
         )
 }
 
@@ -499,11 +502,20 @@ fn three_column_body(
     let mut scopes = vec!["Scopes".to_owned()];
     for (offset, group) in groups[scope_start..scope_end].iter().enumerate() {
         let index = scope_start + offset;
+        let recommended = if group.rows.iter().any(|row| !row.recommended_by.is_empty()) {
+            " ★"
+        } else {
+            ""
+        };
         let label = if catalogs.len() == 1 {
-            format!("{} ${}", scope_state_marker(group, manifest), group.scope)
+            format!(
+                "{} ${}{recommended}",
+                scope_state_marker(group, manifest),
+                group.scope
+            )
         } else {
             format!(
-                "{} {} / ${}",
+                "{} {} / ${}{recommended}",
                 scope_state_marker(group, manifest),
                 group.catalog,
                 group.scope
@@ -626,10 +638,15 @@ fn scope_body(
                 .iter()
                 .filter(|row| manifest.skills.contains_key(&row.key))
                 .count();
-            let label = if catalogs.len() == 1 {
-                format!("${}", group.scope)
+            let recommended = if group.rows.iter().any(|row| !row.recommended_by.is_empty()) {
+                " ★"
             } else {
-                format!("{} / ${}", group.catalog, group.scope)
+                ""
+            };
+            let label = if catalogs.len() == 1 {
+                format!("${}{recommended}", group.scope)
+            } else {
+                format!("{} / ${}{recommended}", group.catalog, group.scope)
             };
             aligned_row(
                 if start + offset == selected {
@@ -741,7 +758,12 @@ fn skill_row_with_marker(
     marker: char,
     width: usize,
 ) -> String {
-    aligned_row(marker, &row.name, &configured_state(row, manifest), width)
+    let label = if row.recommended_by.is_empty() {
+        row.name.clone()
+    } else {
+        format!("★ {}", row.name)
+    };
+    aligned_row(marker, &label, &configured_state(row, manifest), width)
 }
 
 fn aligned_row(marker: char, label: &str, value: &str, width: usize) -> String {
@@ -763,6 +785,11 @@ fn aligned_row(marker: char, label: &str, value: &str, width: usize) -> String {
 fn detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
     let mut lines = vec!["Description".to_owned()];
     lines.extend(wrap(&row.description, width, 2));
+    if !row.recommended_by.is_empty() {
+        lines.push(String::new());
+        lines.push("Recommended".to_owned());
+        lines.extend(wrap(&row.recommended_by.join(", "), width, 2));
+    }
     lines.push(String::new());
     lines.push("Required".to_owned());
     lines.extend(wrap(&required_state(row), width, 2));
@@ -774,11 +801,15 @@ fn detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
 
 fn stacked_detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
-    for (label, value) in [
-        ("Description", row.description.clone()),
+    let mut details = vec![("Description", row.description.clone())];
+    if !row.recommended_by.is_empty() {
+        details.push(("Recommended", row.recommended_by.join(", ")));
+    }
+    details.extend([
         ("Required", required_state(row)),
         ("Installed", installed_state(row)),
-    ] {
+    ]);
+    for (label, value) in details {
         lines.extend(wrap(&format!("{label}: {value}"), width, 2));
     }
     lines
@@ -991,6 +1022,7 @@ mod tests {
             installed,
             installed_mode: installed.then_some(EffectiveMode::Enable),
             required_by: Vec::new(),
+            recommended_by: Vec::new(),
             read_only: false,
             status: None,
             sync: None,
@@ -1076,6 +1108,10 @@ mod tests {
             Some(crate::output::WARNING)
         );
         assert_eq!(
+            segment_color("★ rust-release", state(ConfigScreen::Skills, 0, 0)),
+            Some(crate::output::WARNING)
+        );
+        assert_eq!(
             segment_color("CONFLICT", state(ConfigScreen::Skills, 0, 0)),
             Some(crate::output::ERROR)
         );
@@ -1152,6 +1188,35 @@ mod tests {
         assert!(rendered.contains("By release, skiller"));
         assert!(rendered.contains("Agent + Human as develop"));
         assert!(lines.iter().all(|line| line.width() <= 100));
+    }
+
+    #[test]
+    fn recommendations_mark_scope_and_skill_and_show_exact_reasons() {
+        let mut skill = row("rust-release", "release", false);
+        skill.recommended_by = vec!["file Cargo.toml".to_owned(), "keyword release".to_owned()];
+        let rows = vec![skill];
+        let scope = view_lines(
+            &rows,
+            &ProjectConfig::default(),
+            false,
+            state(ConfigScreen::Scopes, 0, 0),
+            80,
+            14,
+        )
+        .join("\n");
+        assert!(scope.contains("$release ★"));
+        let skills = view_lines(
+            &rows,
+            &ProjectConfig::default(),
+            false,
+            state(ConfigScreen::Skills, 0, 0),
+            100,
+            18,
+        )
+        .join("\n");
+        assert!(skills.contains("› ★ rust-release"));
+        assert!(skills.contains("Recommended"));
+        assert!(skills.contains("file Cargo.toml, keyword release"));
     }
 
     #[test]

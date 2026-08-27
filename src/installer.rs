@@ -24,6 +24,7 @@ use crate::paths::{
 const VERCEL_SKILLS_PACKAGE: &str = "skills@1.5.23";
 const IGNORE_START: &str = "# skiller:start";
 const IGNORE_END: &str = "# skiller:end";
+const MAX_PROJECT_SKILLS_LOCK_BYTES: u64 = 2_000_000;
 
 #[derive(Debug, Clone)]
 pub enum InstallScope {
@@ -327,6 +328,21 @@ pub(crate) fn install_with_catalogs_recovery(
             &manifest.agents,
             &prepared_root,
         )?;
+        let lock_owned_names: BTreeSet<_> = previous
+            .skills
+            .values()
+            .map(|skill| skill.installed_name.clone())
+            .chain(resolved.iter().map(|skill| skill.installed_name.clone()))
+            .chain(effective_replacement_owned.iter().cloned())
+            .chain(cleanup_owned.iter().cloned())
+            .collect();
+        let project_root = match &scope {
+            InstallScope::Project(project_root) => Some(project_root.as_path()),
+            InstallScope::Global => None,
+        };
+        if let Some(project_root) = project_root {
+            changed |= partition_project_skills_lock(project_root, &lock_owned_names)?;
+        }
         let eligible: Vec<_> = resolved
             .iter()
             .filter(|skill| selection.install_names.contains(&skill.installed_name))
@@ -376,15 +392,18 @@ pub(crate) fn install_with_catalogs_recovery(
                     stable_prepared_root.display()
                 )
             })?;
-            let batch_error = run_vercel_install(
-                &paths.command_root,
-                &stable_prepared_root,
-                &eligible,
-                &manifest.agents,
-                scope.is_global(),
-            )
-            .err()
-            .map(|error| format!("{error:#}"));
+            let batch_error =
+                run_vercel_partitioning_project_lock(project_root, &lock_owned_names, || {
+                    run_vercel_install(
+                        &paths.command_root,
+                        &stable_prepared_root,
+                        &eligible,
+                        &manifest.agents,
+                        scope.is_global(),
+                    )
+                })
+                .err()
+                .map(|error| format!("{error:#}"));
             journal.phase = TransactionPhase::I;
             write_json_atomic_compact(&paths.transaction_path, &journal)?;
             let (verified, verification_issues) = verified_skill_names(
@@ -397,11 +416,13 @@ pub(crate) fn install_with_catalogs_recovery(
             complete_names.extend(verified);
             let transaction_complete = verification_issues.is_empty();
             if transaction_complete {
-                run_vercel_remove(
-                    &paths.command_root,
-                    &removed.iter().cloned().collect::<Vec<_>>(),
-                    scope.is_global(),
-                )?;
+                run_vercel_partitioning_project_lock(project_root, &lock_owned_names, || {
+                    run_vercel_remove(
+                        &paths.command_root,
+                        &removed.iter().cloned().collect::<Vec<_>>(),
+                        scope.is_global(),
+                    )
+                })?;
                 journal.phase = TransactionPhase::C;
                 write_json_atomic_compact(&paths.transaction_path, &journal)?;
             }
@@ -767,6 +788,116 @@ fn prepare_skills(resolved: &[ResolvedSkill<'_>], prepared_root: &Path) -> Resul
     Ok(())
 }
 
+fn project_skills_lock_path(project_root: &Path) -> PathBuf {
+    project_root.join("skills-lock.json")
+}
+
+fn read_project_skills_lock(project_root: &Path) -> Result<Option<serde_json::Value>> {
+    let path = project_skills_lock_path(project_root);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("inspecting {}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "project Skills lock must be a real file: {}",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_PROJECT_SKILLS_LOCK_BYTES {
+        bail!("project Skills lock exceeds 2 MB: {}", path.display());
+    }
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let value =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    Ok(Some(value))
+}
+
+fn is_skiller_lock_entry(entry: &serde_json::Value) -> bool {
+    if entry.get("sourceType").and_then(serde_json::Value::as_str) != Some("local") {
+        return false;
+    }
+    let Some(source) = entry.get("source").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let normalized = source.replace('\\', "/");
+    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+    normalized == ".skiller/prepared-current"
+}
+
+fn managed_lock_names_in(
+    value: &serde_json::Value,
+    owned_names: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let skills = value
+        .get("skills")
+        .and_then(serde_json::Value::as_object)
+        .context("project Skills lock has no skills object")?;
+    Ok(skills
+        .iter()
+        .filter(|(name, entry)| owned_names.contains(*name) && is_skiller_lock_entry(entry))
+        .map(|(name, _)| name.clone())
+        .collect())
+}
+
+pub(crate) fn managed_project_lock_names(
+    project_root: &Path,
+    owned_names: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let Some(value) = read_project_skills_lock(project_root)? else {
+        return Ok(BTreeSet::new());
+    };
+    managed_lock_names_in(&value, owned_names)
+}
+
+fn partition_project_skills_lock(
+    project_root: &Path,
+    owned_names: &BTreeSet<String>,
+) -> Result<bool> {
+    let Some(mut value) = read_project_skills_lock(project_root)? else {
+        return Ok(false);
+    };
+    let managed = managed_lock_names_in(&value, owned_names)?;
+    if managed.is_empty() {
+        return Ok(false);
+    }
+    let skills = value
+        .get_mut("skills")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("project Skills lock has no skills object")?;
+    for name in &managed {
+        skills.remove(name);
+    }
+    let path = project_skills_lock_path(project_root);
+    if skills.is_empty() {
+        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+    } else {
+        write_json_atomic(&path, &value)?;
+    }
+    Ok(true)
+}
+
+fn run_vercel_partitioning_project_lock(
+    project_root: Option<&Path>,
+    owned_names: &BTreeSet<String>,
+    run: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let result = run();
+    let cleanup = project_root
+        .map(|root| partition_project_skills_lock(root, owned_names))
+        .transpose();
+    match (result, cleanup) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => Err(error.context(format!(
+            "project Skills lock cleanup also failed: {cleanup:#}"
+        ))),
+    }
+}
+
+// ^ README.md#project-skills-lock partitions Skiller ownership from native Skills entries.
 fn run_vercel_install(
     command_root: &Path,
     prepared_root: &Path,
@@ -1417,6 +1548,7 @@ mod tests {
                         scope: Some("engineering".to_owned()),
                         installed_name: "root".to_owned(),
                         global,
+                        recommend: None,
                         requires: vec!["dependency".to_owned()],
                     },
                 ),
@@ -1429,6 +1561,7 @@ mod tests {
                         scope: Some("engineering".to_owned()),
                         installed_name: "dependency".to_owned(),
                         global,
+                        recommend: None,
                         requires: Vec::new(),
                     },
                 ),
@@ -1689,6 +1822,147 @@ mod tests {
         assert!(selection.protected_names.contains("retired"));
         assert!(selection.blocked[0].contains("orphaned-local"));
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn project_lock_keeps_native_entries_and_excludes_catalog_entries() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/project-lock-partition");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let lock = serde_json::json!({
+            "version": 1,
+            "skills": {
+                "catalog-skill": {
+                    "source": "./.skiller/prepared-current",
+                    "sourceType": "local",
+                    "computedHash": "managed"
+                },
+                "native-skill": {
+                    "source": "owner/native-skills",
+                    "sourceType": "github",
+                    "computedHash": "native"
+                },
+                "native-local": {
+                    "source": "./project-skills",
+                    "sourceType": "local",
+                    "computedHash": "local"
+                }
+            }
+        });
+        write_json_atomic(&root.join("skills-lock.json"), &lock).unwrap();
+        let owned = BTreeSet::from(["catalog-skill".to_owned(), "native-local".to_owned()]);
+        assert_eq!(
+            managed_project_lock_names(&root, &owned).unwrap(),
+            BTreeSet::from(["catalog-skill".to_owned()])
+        );
+        assert!(partition_project_skills_lock(&root, &owned).unwrap());
+        let cleaned: serde_json::Value = read_json(&root.join("skills-lock.json")).unwrap();
+        assert!(cleaned["skills"].get("catalog-skill").is_none());
+        assert_eq!(cleaned["skills"]["native-skill"]["computedHash"], "native");
+        assert_eq!(cleaned["skills"]["native-local"]["computedHash"], "local");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_vercel_action_partitions_project_lock() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/project-lock-failed-action");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let owned = BTreeSet::from(["catalog-skill".to_owned()]);
+        let error = run_vercel_partitioning_project_lock(Some(&root), &owned, || {
+            write_json_atomic(
+                &root.join("skills-lock.json"),
+                &serde_json::json!({
+                    "version": 1,
+                    "skills": {
+                        "catalog-skill": {
+                            "source": "./.skiller/prepared-current",
+                            "sourceType": "local",
+                            "computedHash": "managed"
+                        },
+                        "native-skill": {
+                            "source": "owner/native-skills",
+                            "sourceType": "github",
+                            "computedHash": "native"
+                        }
+                    }
+                }),
+            )?;
+            bail!("placement failed")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("placement failed"));
+        let cleaned: serde_json::Value = read_json(&root.join("skills-lock.json")).unwrap();
+        assert!(cleaned["skills"].get("catalog-skill").is_none());
+        assert_eq!(cleaned["skills"]["native-skill"]["computedHash"], "native");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_lock_disappears_when_it_contains_only_catalog_entries() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/project-lock-catalog-only");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_json_atomic(
+            &root.join("skills-lock.json"),
+            &serde_json::json!({
+                "version": 1,
+                "skills": {
+                    "catalog-skill": {
+                        "source": ".skiller/prepared-current",
+                        "sourceType": "local",
+                        "computedHash": "managed"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert!(
+            partition_project_skills_lock(&root, &BTreeSet::from(["catalog-skill".to_owned()]))
+                .unwrap()
+        );
+        assert!(!root.join("skills-lock.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_lock_rejects_malformed_and_oversized_input() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/project-lock-invalid");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("skills-lock.json"), b"not JSON").unwrap();
+        assert!(managed_project_lock_names(&root, &BTreeSet::new()).is_err());
+        std::fs::write(
+            root.join("skills-lock.json"),
+            vec![b' '; MAX_PROJECT_SKILLS_LOCK_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(managed_project_lock_names(&root, &BTreeSet::new()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_lock_rejects_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/project-lock-symlink");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("outside.json"), r#"{"version":1,"skills":{}}"#).unwrap();
+        symlink(root.join("outside.json"), root.join("skills-lock.json")).unwrap();
+        assert!(managed_project_lock_names(&root, &BTreeSet::new()).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1,3 +1,15 @@
+## [0.11.0] - 2026-08-27
+
+### Features
+
+- Add bounded catalog-authored project recommendations from exact root files and literal manifest/document keywords, with machine-readable reasons and semantic TUI presentation.
+- Partition project skill ownership so Skiller catalog projections stay out of `skills-lock.json` while native Vercel Skills entries remain intact.
+
+### Changed
+
+- Keep global and project catalog eligibility exclusive; selectively configured skills remain project-catalogued, and explicit Off can clear a selection whose eligibility later changed.
+- Diagnose and repair legacy Skiller entries in the project Skills lock without claiming or pruning native entries.
+
 ## [0.10.0] - 2026-08-27
 
 ### Features
