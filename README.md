@@ -15,7 +15,7 @@ skiller doctor [-g] [--repair [--yes]]
 
 `STATE` is `enable`, `manual`, `enable-ignored`, `manual-ignored`, or `off`. Project is the safe default for new catalog skills; `--global` is explicit. Project and global eligibility are exclusive, so globally catalogued skills never appear in project configuration. An explicit `off` may remove an existing selection whose catalog eligibility later changed.
 
-Read-only commands choose output automatically. A TTY gets the organized interactive or human view with semantic color and status icons; `NO_COLOR` and `TERM=dumb` disable styling. A pipe, agent, or subprocess gets compact one-line JSON where supported and plain output otherwise. `config` and `doctor` use synchronized cache only; `update` and `install` own remote refresh. Global `update` checks the stable Skiller release without blocking skill results when the registry is unavailable, and reports a newer binary without installing it.
+Read-only commands choose output automatically. A TTY gets the organized interactive or human view with semantic color and status icons; `NO_COLOR` and `TERM=dumb` disable styling. A pipe, agent, or subprocess gets compact one-line JSON where supported and plain output otherwise. Interactive `config` and `config --set` refresh registered catalogs before selection; piped config inspection and `doctor` use synchronized cache only. A failed config refresh keeps the last known-good catalog visible as read-only and shows the source failure plus recovery. `update` and `install` refresh catalogs before reconciling selected skills. Global `update` checks the stable Skiller release without blocking skill results when the registry is unavailable, and reports a newer binary without installing it.
 
 ## Configuration
 

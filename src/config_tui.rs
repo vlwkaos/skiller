@@ -785,6 +785,11 @@ fn aligned_row(marker: char, label: &str, value: &str, width: usize) -> String {
 fn detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
     let mut lines = vec!["Description".to_owned()];
     lines.extend(wrap(&row.description, width, 2));
+    if let Some(reason) = &row.read_only_reason {
+        lines.push(String::new());
+        lines.push("Availability".to_owned());
+        lines.extend(wrap(reason, width, 3));
+    }
     if !row.recommended_by.is_empty() {
         lines.push(String::new());
         lines.push("Recommended".to_owned());
@@ -802,6 +807,9 @@ fn detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
 fn stacked_detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut details = vec![("Description", row.description.clone())];
+    if let Some(reason) = &row.read_only_reason {
+        details.push(("Availability", reason.clone()));
+    }
     if !row.recommended_by.is_empty() {
         details.push(("Recommended", row.recommended_by.join(", ")));
     }
@@ -915,6 +923,9 @@ fn key_hint(
                     hints.push("[I] Git-ignore");
                     compact.push("[I] Ignore");
                 }
+            } else if row.is_some_and(|row| row.read_only_reason.is_some()) {
+                hints.push("[Read-only: catalog stale]");
+                compact.push("[Read-only]");
             }
             hints.extend([save, "[Esc] Scopes"]);
             compact.extend([save, "[Esc] Scopes"]);
@@ -1025,6 +1036,7 @@ mod tests {
             recommended_by: Vec::new(),
             read_only: false,
             status: None,
+            read_only_reason: None,
             sync: None,
             authoring: None,
         }
@@ -1287,6 +1299,37 @@ mod tests {
         assert!(!rendered.contains("[I] Git-ignore"));
         assert!(rendered.contains("[S] Save"));
         assert!(rendered.contains("[Esc] Scopes"));
+    }
+
+    #[test]
+    fn stale_skill_explains_read_only_state_and_ignores_space() {
+        let mut stale = row("intrafetch", "kakao", false);
+        stale.catalog = "kakao".to_owned();
+        stale.key = "kakao/intrafetch".to_owned();
+        stale.read_only = true;
+        stale.status = Some("stale".to_owned());
+        stale.read_only_reason = Some(
+            "Catalog refresh failed: network unavailable. Restore source access and reopen config."
+                .to_owned(),
+        );
+        let rows = vec![stale];
+        let mut manifest = ProjectConfig::default();
+        let mut position = state(ConfigScreen::Skills, 0, 0);
+        handle_key(
+            &rows,
+            &mut manifest,
+            false,
+            &mut position,
+            KeyCode::Char(' '),
+        );
+        assert!(manifest.skills.is_empty());
+
+        let rendered = view_lines(&rows, &manifest, false, position, 100, 18).join("\n");
+        assert!(rendered.contains("Availability"));
+        assert!(rendered.contains("Catalog refresh failed:"));
+        assert!(rendered.contains("unavailable. Restore source access"));
+        assert!(rendered.contains("[Read-only: catalog stale]"));
+        assert!(!rendered.contains("[Space] Mode"));
     }
 
     #[test]

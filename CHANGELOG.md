@@ -1,3 +1,10 @@
+## [0.11.1] - 2026-09-11
+
+### Fixed
+
+- Refresh registered catalogs before interactive or mutating configuration so newly published remote skills can be selected without a separate update cycle.
+- Explain stale catalog rows in configuration details and mutation errors instead of silently ignoring unavailable selection actions.
+
 ## [0.11.0] - 2026-08-27
 
 ### Features

@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::catalog::{
     CatalogAvailability, CatalogIndex, CatalogStatus, load_global_config,
-    sync_registered_catalogs_cached,
+    sync_registered_catalogs_cached, sync_registered_catalogs_resilient,
 };
 use crate::installer::{
     InstallScope, ProjectionStatus, ResolvedSkill, projection_status, resolve_manifest,
@@ -49,6 +49,8 @@ pub(crate) struct ConfigRow {
     pub(crate) read_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) read_only_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sync: Option<ProjectionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,6 +94,8 @@ struct PrintedSkill<'a> {
     read_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_only_reason: Option<&'a str>,
     #[serde(skip_serializing_if = "sync_is_default")]
     sync: Option<ProjectionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,6 +126,7 @@ fn printed_skill(row: &ConfigRow) -> PrintedSkill<'_> {
         recommended_by: &row.recommended_by,
         read_only: row.read_only,
         status: row.status.as_deref(),
+        read_only_reason: row.read_only_reason.as_deref(),
         sync: row.sync,
         authoring: row.authoring.as_deref(),
     }
@@ -160,7 +165,11 @@ pub fn configure(
         anyhow::bail!("no catalogs configured; run `skiller catalog configure <alias> <source>`");
     }
     let read_only = machine && assignments.is_empty() && agents.is_empty();
-    let sync = sync_registered_catalogs_cached(&global_config)?;
+    let sync = if read_only {
+        sync_registered_catalogs_cached(&global_config)?
+    } else {
+        sync_registered_catalogs_resilient(&global_config)?
+    };
     let catalogs = sync.catalogs.clone();
     let (config_path, state_path, mut manifest) = match &scope {
         InstallScope::Project(project_root) => {
@@ -185,12 +194,6 @@ pub fn configure(
     validate_schema(manifest.version, "skill config")?;
     let state: InstalledState = read_json_or_default(&state_path)?;
     validate_installed_state(state.version)?;
-    let stale_aliases: BTreeSet<_> = sync
-        .statuses
-        .iter()
-        .filter(|(_, status)| status.availability == CatalogAvailability::Stale)
-        .map(|(alias, _)| alias.clone())
-        .collect();
     let mut display_catalogs = catalogs.clone();
     for (alias, status) in &sync.statuses {
         if let Some(catalog) = &status.catalog
@@ -228,7 +231,7 @@ pub fn configure(
         scope.is_global(),
         project_root,
         &desired_by_key,
-        &stale_aliases,
+        &sync.statuses,
     )?;
     for row in &mut rows {
         if matches!(
@@ -417,7 +420,7 @@ fn config_rows(
     global_scope: bool,
     project_root: Option<&Path>,
     desired: &BTreeMap<&str, &ResolvedSkill<'_>>,
-    stale_aliases: &BTreeSet<String>,
+    catalog_statuses: &BTreeMap<String, CatalogStatus>,
 ) -> Result<Vec<ConfigRow>> {
     let evidence = project_root.map(project_evidence).unwrap_or_default();
     let mut rows: Vec<_> = catalogs
@@ -448,6 +451,9 @@ fn config_rows(
                         .skills
                         .get(&key)
                         .filter(|installed| installed_name_is_current(installed, &installed_name));
+                    let stale = catalog_statuses.get(&catalog.alias).filter(|status| {
+                        status.availability == CatalogAvailability::Stale
+                    });
                     ConfigRow {
                         key: key.clone(),
                         catalog: catalog.alias.clone(),
@@ -462,10 +468,14 @@ fn config_rows(
                         gitignore: selection.is_some_and(SkillSelection::gitignore),
                         required_by,
                         recommended_by: recommendation_reasons(skill.recommend.as_ref(), &evidence),
-                        read_only: stale_aliases.contains(&catalog.alias),
-                        status: stale_aliases
-                            .contains(&catalog.alias)
-                            .then_some("stale".to_owned()),
+                        read_only: stale.is_some(),
+                        status: stale.map(|_| "stale".to_owned()),
+                        read_only_reason: stale.map(|status| {
+                            let detail = status.warning.as_deref().unwrap_or("source unavailable");
+                            format!(
+                                "Catalog refresh failed: {detail}. Restore source access and reopen config."
+                            )
+                        }),
                         sync: None,
                         authoring: None,
                     }
@@ -508,6 +518,7 @@ fn config_rows(
                 recommended_by: Vec::new(),
                 read_only: true,
                 status: Some("orphaned".to_owned()),
+                read_only_reason: None,
                 sync: Some(ProjectionStatus::OrphanedLocal),
                 authoring: None,
             });
@@ -624,6 +635,13 @@ fn apply_assignments(
             format!("invalid selection {assignment:?}; expected catalog/name=STATE")
         })?;
         if !(available.contains(key) || state == "off" && manifest.skills.contains_key(key)) {
+            if let Some(reason) = rows
+                .iter()
+                .find(|row| row.key == key)
+                .and_then(|row| row.read_only_reason.as_deref())
+            {
+                anyhow::bail!("skill cannot be changed: {key}. {reason}");
+            }
             anyhow::bail!("skill is unavailable in this configuration: {key}");
         }
         if !seen.insert(key) {
@@ -754,6 +772,7 @@ mod tests {
             recommended_by: Vec::new(),
             read_only: false,
             status: None,
+            read_only_reason: None,
             sync: None,
             authoring: None,
         }];
@@ -808,6 +827,44 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn stale_assignment_explains_why_the_skill_cannot_change() {
+        let rows = vec![ConfigRow {
+            key: "kakao/intrafetch".to_owned(),
+            catalog: "kakao".to_owned(),
+            scope: "kakao".to_owned(),
+            scope_order: 0,
+            name: "intrafetch".to_owned(),
+            installed_name: "intrafetch".to_owned(),
+            description: "Fetch internal pages".to_owned(),
+            selected: None,
+            gitignore: false,
+            installed: false,
+            installed_mode: None,
+            required_by: Vec::new(),
+            recommended_by: Vec::new(),
+            read_only: true,
+            status: Some("stale".to_owned()),
+            read_only_reason: Some(
+                "Catalog refresh failed: network unavailable. Restore source access and reopen config."
+                    .to_owned(),
+            ),
+            sync: None,
+            authoring: None,
+        }];
+        let error = apply_assignments(
+            &mut ProjectConfig::default(),
+            &rows,
+            &["kakao/intrafetch=enable".to_owned()],
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("skill cannot be changed: kakao/intrafetch"));
+        assert!(error.contains("Catalog refresh failed: network unavailable"));
+        assert!(error.contains("reopen config"));
     }
 
     #[test]
@@ -938,7 +995,7 @@ mod tests {
             false,
             Some(&root),
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1000,6 +1057,15 @@ mod tests {
         let catalogs = BTreeMap::from([("pyg".to_owned(), catalog)]);
         let manifest = ProjectConfig::default();
         let state = InstalledState::default();
+        let statuses = BTreeMap::from([(
+            "pyg".to_owned(),
+            CatalogStatus {
+                alias: "pyg".to_owned(),
+                availability: CatalogAvailability::Stale,
+                warning: Some("network unavailable".to_owned()),
+                catalog: None,
+            },
+        )]);
         let global = config_rows(
             &catalogs,
             &state,
@@ -1007,7 +1073,7 @@ mod tests {
             true,
             None,
             &BTreeMap::new(),
-            &BTreeSet::from(["pyg".to_owned()]),
+            &statuses,
         )
         .unwrap();
         let project = config_rows(
@@ -1017,13 +1083,19 @@ mod tests {
             false,
             None,
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(global[0].name, "global");
         assert_eq!(global[0].installed_name, "global-scope");
         assert!(global[0].read_only);
         assert_eq!(global[0].status.as_deref(), Some("stale"));
+        assert_eq!(
+            global[0].read_only_reason.as_deref(),
+            Some(
+                "Catalog refresh failed: network unavailable. Restore source access and reopen config."
+            )
+        );
         assert_eq!(project[0].name, "project");
         assert_eq!(project[0].installed_name, "project-scope");
     }
