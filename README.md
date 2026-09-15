@@ -5,6 +5,7 @@ Declarative Agent Skill catalogs and convergent project/global installation over
 ## Commands
 
 ```bash
+skiller
 skiller catalog configure <alias> <source> [--ref <ref>] [--authoring-root <path>]
 skiller catalog add-skill <alias> <skill> <scope> [--global]
 skiller config [-g] [--set catalog/name=STATE] [--agents universal,claude-code,pi]
@@ -13,13 +14,24 @@ skiller install [-g]
 skiller doctor [-g] [--repair [--yes]]
 ```
 
+Run bare `skiller` to choose Project or Global configuration. Saving interactive configuration and applying `config --set` or `--agents` immediately reconcile the matching installation. Piped read-only `config` remains inspection-only. Explicit `install` remains available for recovery and automation.
+
 `STATE` is `enable`, `manual`, `enable-ignored`, `manual-ignored`, or `off`. Project is the safe default for new catalog skills; `--global` is explicit. Project and global eligibility are exclusive, so globally catalogued skills never appear in project configuration. An explicit `off` may remove an existing selection whose catalog eligibility later changed.
 
-Read-only commands choose output automatically. A TTY gets the organized interactive or human view with semantic color and status icons; `NO_COLOR` and `TERM=dumb` disable styling. A pipe, agent, or subprocess gets compact one-line JSON where supported and plain output otherwise. `config` and `doctor` use synchronized cache only; `update` and `install` own remote refresh. Global `update` checks the stable Skiller release without blocking skill results when the registry is unavailable, and reports a newer binary without installing it.
+Read-only commands choose output automatically. A TTY gets the organized interactive or human view with semantic color and status icons; `NO_COLOR` and `TERM=dumb` disable styling. A pipe, agent, or subprocess gets compact one-line JSON where supported and plain output otherwise. Interactive `config` and mutating `config --set` or `--agents` refresh catalogs; piped read-only `config` and `doctor` use synchronized cache only. Failed config refreshes show cached catalog entries as read-only with recovery guidance. `update` and `install` retain their explicit reconciliation roles. Global `update` checks the stable Skiller release without blocking skill results when the registry is unavailable, and reports a newer binary without installing it.
 
 ## Configuration
 
-Global configuration is `~/.config/skiller/config.json`. Project configuration is `<project>/skiller.config.json`.
+Skiller keeps policy and generated state outside the tracked worktree:
+
+| Data | Path | Scope |
+|---|---|---|
+| Global configuration | `~/.config/skiller/config.json` | Device |
+| Project configuration | `$(git rev-parse --git-common-dir)/skiller/config.json` | Repository clone, shared by linked worktrees |
+| Project installation state | `$(git rev-parse --git-dir)/skiller/installed.json` | Current worktree |
+| Installed projections | `<worktree>/.agents/skills/` and agent-native equivalents | Current worktree |
+
+Project mode requires Git. Outside a repository, bare `skiller` opens Global configuration directly.
 
 ```json
 {
@@ -41,27 +53,28 @@ Global configuration is `~/.config/skiller/config.json`. Project configuration i
 
 Canonical `source` and optional `ref` own consumer content. `authoring_root` is an optional writable checkout used for guidance and unpublished-draft checks. Installation always uses canonical content.
 
-Interactive configuration restores the pre-Skiller selector geometry. Wide terminals keep scope navigation, compact one-line skill/configuration rows, and selected description, recommendation, required-by, installed, and sync details visible in three columns. Enter moves focus from scopes to skills; Escape moves back. Narrow terminals retain the same scope-first navigation and stack only the selected skill's labeled details. Semantic scope, mode, recommendation, warning, error, focus, and hint colors remain stable and respect `NO_COLOR` and `TERM=dumb`. Redraws queue one synchronized frame and replace rows in place instead of blanking the alternate screen.
+Interactive configuration restores the pre-Skiller selector geometry. Wide terminals keep scope navigation, compact one-line skill/configuration rows, and selected description, direct requirements, install bundle, required-by, installed, and sync details visible in three columns. Enter moves focus from scopes to skills; Escape moves back. Narrow terminals retain the same scope-first navigation and stack only the selected skill's labeled details. Semantic scope, mode, recommendation, warning, error, focus, and hint colors remain stable and respect `NO_COLOR` and `TERM=dumb`. Redraws queue one synchronized frame and replace rows in place instead of blanking the alternate screen.
 
-Enabled skills allow agent and human invocation. Manual skills are human-only unless required. Unselected dependencies are agent-only. Dependency reachability never changes configured selection.
+Enabled skills allow agent and human invocation. Manual skills are human-only unless required. Unselected dependencies are agent-only. Dependency reachability never changes configured selection. Every install prints all configured roots as a dependency forest. Each edge names the immediate root or dependency that requires the child, and directly configured dependencies retain their configured mode annotation.
 
 ## Project reconciliation
 
-Global projections are canonical. Project projections are writable working content tracked against the exact tree Skiller last installed.
+Catalog-managed installations are read-only, disposable projections. The catalog is authoritative.
 
 | Status | Meaning | Install behavior |
 |---|---|---|
-| `synced` | Project matches its baseline | Apply incoming catalog updates |
-| `keep-local` | Only project content changed | Preserve the complete project skill |
-| `conflict` | Project and catalog changed | Preserve, block the skill and dependents, return nonzero |
-| `orphaned-local` | Upstream removal/rename would discard project work | Preserve and require manual review |
-| `unknown` | Older state has no exact baseline | Preserve conservatively until reconciled |
+| `synced` | Projection matches the installed catalog tree | No content change |
+| `missing` | An owned projection is absent | Reinstall it |
+| `drift` | Projection differs from authoritative content or lacks an old baseline | Overwrite it |
+| `incoming` | Catalog identity, mode, or metadata changed | Install the new projection |
 
-Config JSON and the TUI show the sync state and validated authoring skill path. Skiller never promotes, merges, commits, or publishes project edits. Matching current canonical content resolves divergence automatically.
+To change a managed skill, edit its catalog authoring source, publish it, then run `skiller config` or `skiller install`. Skiller does not preserve project overrides or merge projection edits. A divergent unowned same-name skill remains protected and blocks noninteractive installation; byte-identical unowned projections are adopted safely.
+
+On the first mutating Project command, Skiller imports legacy `<project>/skiller.config.json` and `<project>/.skiller/` data. It removes untracked legacy files after successful migration. A tracked or divergent legacy config remains for explicit review but is ignored once the Git-private config exists.
 
 ## Project Skills lock
 
-Skiller catalog skills are owned only by `.skiller/installed.json`; native project skills added directly through Vercel Skills are owned only by `skills-lock.json`. Before and after Vercel placement, reconciliation removes only state-proven Skiller entries whose lock source is `.skiller/prepared-current` and preserves every native entry. Skills 1.5.23 add, install, sync, and named removal do not prune unrelated projections.
+Skiller catalog skills are owned only by the current worktree's Git-private `skiller/installed.json`; native project skills added directly through Vercel Skills are owned only by `skills-lock.json`. Before and after Vercel placement, reconciliation removes only state-proven Skiller entries whose source resolves to the current Git-private `skiller/prepared-current` and preserves every native entry. Skills 1.5.23 add, install, sync, and named removal do not prune unrelated projections.
 
 ## Catalog
 
@@ -75,16 +88,16 @@ A project-only skill may declare `metadata.skiller.recommend.files: "Cargo.toml"
 
 ## Doctor and recovery
 
-`skiller doctor [-g]` is read-only. Its human report maps diagnosed catalog freshness, projection drift, residual catalog entries in the project Skills lock, and owned-state problems to explicit `update`, `install`, or `doctor --repair` suggestions without prompting or mutating. Non-TTY Doctor JSON remains stable and does not include presentation-only recommendations. Repair still requires `--repair` and confirmation unless `--yes` is supplied.
+`skiller doctor [-g]` is read-only. Its human report groups ownership conflicts by skill and maps catalog freshness, projection drift, project Skills lock entries, and owned-state problems to explicit actions. `skiller install [-g]` adopts byte-identical unowned skills automatically; divergent content stays unchanged and Doctor shows the exact command to keep the existing owner. Non-TTY Doctor JSON remains deterministic and does not include presentation-only recommendations. Repair still requires `--repair` and confirmation unless `--yes` is supplied.
 
 ## Safety
 
 - Skiller removes only verified ownership or exact approved recovery names.
 - Unowned projections are adopted only when every discovered copy is byte-identical.
-- Installed state is compact schema 4 and records catalog identity plus exact content baseline.
+- Installed state is compact schema 4 and records catalog identity plus the authoritative content baseline.
 - Install resumes only validated interrupted transactions and retains independent per-skill progress.
-- Modified project skills are never removed, renamed, or overwritten automatically.
-- Global installed directories remain read-only projections; project projections may carry tracked overrides.
+- Catalog-owned project and global projections are overwritten from authoritative content.
+- Tracked legacy configuration is never deleted automatically; migrated legacy paths stop competing as readers.
 - Vercel listing is bounded to 15 seconds and placement to 60 seconds.
 - Git SSH acquisition is bounded and repeated unreachable sources are suppressed briefly.
 - Permission, process, network, timeout, placement, and state failures are classified separately.

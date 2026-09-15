@@ -12,7 +12,7 @@ use crate::catalog::{
 };
 use crate::installer::{InstallScope, install_paths, resolve_manifest};
 use crate::model::{InstalledState, ProjectConfig};
-use crate::paths::{output_bounded, read_json, read_json_or_default};
+use crate::paths::{output_bounded, read_json_or_default};
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,8 +141,11 @@ pub fn run(scope: InstallScope, machine: bool, yes: bool) -> Result<()> {
     let unavailable_aliases = sync.unavailable_aliases();
     let catalogs = sync.catalogs;
     let manifest = match &scope {
-        InstallScope::Project(root) => read_json(&root.join("skiller.config.json"))
-            .context("run `skiller config` before checking updates")?,
+        InstallScope::Project(root) => {
+            crate::project_store::load_project_config(root, false, true)
+                .context("run `skiller config` before checking updates")?
+                .manifest
+        }
         InstallScope::Global => ProjectConfig {
             version: global.version,
             skills: global.skills.clone(),

@@ -7,6 +7,7 @@ mod manual;
 mod model;
 mod output;
 mod paths;
+mod project_store;
 mod update;
 
 use std::io::{self, IsTerminal};
@@ -14,6 +15,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use installer::InstallScope;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -23,7 +25,7 @@ use clap::{Args, Parser, Subcommand};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -130,7 +132,22 @@ fn parse_agents(value: Option<String>) -> Result<Vec<String>> {
 fn main() -> Result<()> {
     let machine = !io::stdout().is_terminal();
     match Cli::parse().command {
-        Command::Catalog { command } => match command {
+        None if machine => anyhow::bail!(
+            "interactive configuration requires a terminal; run `skiller config` or another command"
+        ),
+        None => match paths::project_root() {
+            Err(_) => config_ui::configure(InstallScope::Global, false, &[], &[]),
+            Ok(project_root) => match config_tui::choose_configuration_scope()? {
+                Some(config_tui::ConfigurationScope::Project) => {
+                    config_ui::configure(InstallScope::Project(project_root), false, &[], &[])
+                }
+                Some(config_tui::ConfigurationScope::Global) => {
+                    config_ui::configure(InstallScope::Global, false, &[], &[])
+                }
+                None => Ok(()),
+            },
+        },
+        Some(Command::Catalog { command }) => match command {
             CatalogCommand::AddSkill(args) => catalog::add_skill(
                 &args.alias,
                 &args.source,
@@ -148,24 +165,29 @@ fn main() -> Result<()> {
                 args.authoring_root.as_deref(),
             ),
         },
-        Command::Config {
+        Some(Command::Config {
             global,
             set,
             agents,
-        } => config_ui::configure(scope(global)?, machine, &set, &parse_agents(agents)?),
-        Command::Doctor {
+        }) => config_ui::configure(scope(global)?, machine, &set, &parse_agents(agents)?),
+        Some(Command::Doctor {
             global,
             repair,
             yes,
-        } => doctor::run(scope(global)?, machine, repair, yes),
-        Command::Update { global, yes } => update::run(scope(global)?, machine, yes),
-        Command::Install { global } => installer::install(scope(global)?),
+        }) => doctor::run(scope(global)?, machine, repair, yes),
+        Some(Command::Update { global, yes }) => update::run(scope(global)?, machine, yes),
+        Some(Command::Install { global }) => installer::install(scope(global)?),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_cli_selects_interactive_configuration() {
+        assert!(Cli::try_parse_from(["skiller"]).unwrap().command.is_none());
+    }
 
     #[test]
     fn lean_cli_rejects_removed_compatibility_surface() {

@@ -62,6 +62,7 @@ struct Inputs {
     statuses: BTreeMap<String, CatalogStatus>,
     unavailable_aliases: BTreeSet<String>,
     declared_counts: BTreeMap<String, usize>,
+    legacy_project_config: bool,
 }
 
 // ^ README.md#doctor-and-recovery defines the read-only and explicit-repair boundary.
@@ -89,6 +90,34 @@ pub fn run(scope: InstallScope, machine: bool, repair: bool, yes: bool) -> Resul
     validate_agents(&inputs.manifest.agents)?;
     let paths = install_paths(&scope)?;
     let mut issues = Vec::new();
+    if inputs.legacy_project_config {
+        issues.push(DoctorIssue {
+            code: "legacy-project-config",
+            message: "project configuration still uses legacy skiller.config.json".to_owned(),
+            fixable: true,
+        });
+    }
+    if let InstallScope::Project(project_root) = &scope
+        && project_root.join(".skiller").exists()
+    {
+        match crate::project_store::legacy_state_is_fully_migratable(project_root) {
+            Ok(fixable) => issues.push(DoctorIssue {
+                code: "legacy-project-state",
+                message: if fixable {
+                    "project state still uses the legacy .skiller directory".to_owned()
+                } else {
+                    "legacy .skiller contains unknown or unowned content that requires review"
+                        .to_owned()
+                },
+                fixable,
+            }),
+            Err(error) => issues.push(DoctorIssue {
+                code: "legacy-project-state",
+                message: error.to_string(),
+                fixable: false,
+            }),
+        }
+    }
     let migrated =
         match migrate_declared_renames(&inputs.manifest, &inputs.catalogs, scope.is_global()) {
             Ok((migrated, rename_messages)) => {
@@ -276,10 +305,6 @@ pub fn run(scope: InstallScope, machine: bool, repair: bool, yes: bool) -> Resul
             .iter()
             .map(|skill| (skill.key.as_str(), skill))
             .collect();
-        let desired_names: BTreeSet<_> = resolved
-            .iter()
-            .map(|skill| skill.installed_name.as_str())
-            .collect();
         for (key, installed) in &state.skills {
             if key
                 .split_once('/')
@@ -288,38 +313,14 @@ pub fn run(scope: InstallScope, machine: bool, repair: bool, yes: bool) -> Resul
                 continue;
             }
             match desired_by_key.get(key.as_str()) {
-                None => {
-                    let actual = paths
-                        .command_root
-                        .join(".agents/skills")
-                        .join(&installed.installed_name);
-                    let local = !scope.is_global()
-                        && matches!(
-                            projection_status(false, installed, None, &actual)?,
-                            ProjectionStatus::KeepLocal
-                                | ProjectionStatus::Conflict
-                                | ProjectionStatus::Unknown
-                        );
-                    issues.push(DoctorIssue {
-                        code: if local {
-                            "orphaned-local"
-                        } else {
-                            "obsolete-owned-skill"
-                        },
-                        message: if local {
-                            format!(
-                                "{key} was removed from the catalog but has project changes; keeping {} unchanged",
-                                installed.installed_name
-                            )
-                        } else {
-                            format!(
-                                "owned skill {} ({key}) is no longer desired",
-                                installed.installed_name
-                            )
-                        },
-                        fixable: !local,
-                    });
-                }
+                None => issues.push(DoctorIssue {
+                    code: "obsolete-owned-skill",
+                    message: format!(
+                        "owned skill {} ({key}) is no longer desired",
+                        installed.installed_name
+                    ),
+                    fixable: true,
+                }),
                 Some(desired)
                     if desired.installed_name != installed.installed_name
                         || desired.mode != installed.mode
@@ -340,47 +341,22 @@ pub fn run(scope: InstallScope, machine: bool, repair: bool, yes: bool) -> Resul
                 }
                 Some(_) => {}
             }
-            if !scope.is_global()
-                && let Some(desired) = desired_by_key.get(key.as_str())
-            {
+            if let Some(desired) = desired_by_key.get(key.as_str()) {
                 let actual = paths
                     .command_root
                     .join(".agents/skills")
                     .join(&installed.installed_name);
-                match projection_status(false, installed, Some(desired), &actual)? {
-                    ProjectionStatus::KeepLocal => issues.push(DoctorIssue {
-                        code: "project-override",
-                        message: format!(
-                            "{key} has project changes and is being kept unchanged"
-                        ),
-                        fixable: false,
-                    }),
-                    ProjectionStatus::Conflict => issues.push(DoctorIssue {
-                        code: "project-conflict",
-                        message: format!(
-                            "{key} has both project and catalog changes; merge or promote it manually"
-                        ),
-                        fixable: false,
-                    }),
-                    ProjectionStatus::Unknown => issues.push(DoctorIssue {
-                        code: "project-baseline",
-                        message: format!("{key} needs a schema-4 project content baseline"),
+                if projection_status(scope.is_global(), installed, Some(desired), &actual)?
+                    == ProjectionStatus::Drift
+                {
+                    issues.push(DoctorIssue {
+                        code: "managed-drift",
+                        message: format!("{key} differs from its authoritative catalog content"),
                         fixable: true,
-                    }),
-                    _ => {}
+                    });
                 }
             }
         }
-        for desired in resolved {
-            if !state.skills.contains_key(&desired.key) {
-                issues.push(DoctorIssue {
-                    code: "missing-owned-skill",
-                    message: format!("{} is desired but absent from ownership state", desired.key),
-                    fixable: true,
-                });
-            }
-        }
-
         let mut owned_names: BTreeSet<_> = state
             .skills
             .values()
@@ -400,42 +376,59 @@ pub fn run(scope: InstallScope, machine: bool, repair: bool, yes: bool) -> Resul
                 )
             })
             .collect();
-        for name in desired_names {
-            for root in projection_roots(&paths.command_root, scope.is_global()) {
+        for (agent, snapshot) in &agent_snapshots {
+            if let Err(error) = snapshot {
+                issues.push(DoctorIssue {
+                    code: "agent-target",
+                    message: format!("cannot inspect Vercel agent {agent}: {error}"),
+                    fixable: false,
+                });
+            }
+        }
+        let roots = projection_roots(&paths.command_root, scope.is_global());
+        for desired in resolved {
+            let name = desired.installed_name.as_str();
+            let name_is_owned = owned_names.contains(name);
+            let has_projection = roots.iter().any(|root| {
                 let entry = root.join(name);
-                if (entry.exists() || entry.is_symlink()) && !owned_names.contains(name) {
-                    issues.push(DoctorIssue {
-                        code: "unowned-conflict",
-                        message: format!(
-                            "refusing to replace unowned projection {}",
-                            entry.display()
-                        ),
-                        fixable: false,
-                    });
-                }
+                entry.exists() || entry.is_symlink()
+            });
+            let has_agent_entry = agent_snapshots
+                .values()
+                .filter_map(|snapshot| snapshot.as_ref().ok())
+                .any(|installed| installed.contains(name));
+
+            if !name_is_owned && (has_projection || has_agent_entry) {
+                issues.push(DoctorIssue {
+                    code: "unowned-conflict",
+                    message: format!(
+                        "{} conflicts with existing unowned {name}; matching content can be adopted, otherwise keep it with `skiller config{} --set {}=off`",
+                        desired.key,
+                        if scope.is_global() { " -g" } else { "" },
+                        desired.key
+                    ),
+                    fixable: false,
+                });
+                continue;
+            }
+            if !state.skills.contains_key(&desired.key) {
+                issues.push(DoctorIssue {
+                    code: "missing-owned-skill",
+                    message: format!("{} is selected but not installed", desired.key),
+                    fixable: true,
+                });
+                continue;
             }
             for (agent, snapshot) in &agent_snapshots {
-                match snapshot {
-                    Ok(installed) if installed.contains(name) && !owned_names.contains(name) => {
-                        issues.push(DoctorIssue {
-                            code: "unowned-conflict",
-                            message: format!(
-                                "refusing to replace unowned {name} for Vercel agent {agent}"
-                            ),
-                            fixable: false,
-                        });
-                    }
-                    Ok(installed) if !installed.contains(name) => issues.push(DoctorIssue {
+                if snapshot
+                    .as_ref()
+                    .is_ok_and(|installed| !installed.contains(name))
+                {
+                    issues.push(DoctorIssue {
                         code: "projection-drift",
                         message: format!("{name} is missing for Vercel agent {agent}"),
                         fixable: true,
-                    }),
-                    Ok(_) => {}
-                    Err(error) => issues.push(DoctorIssue {
-                        code: "agent-target",
-                        message: error.clone(),
-                        fixable: false,
-                    }),
+                    });
                 }
             }
         }
@@ -448,7 +441,7 @@ pub fn run(scope: InstallScope, machine: bool, repair: bool, yes: bool) -> Resul
         return Ok(());
     }
     if issues.iter().any(|issue| !issue.fixable) {
-        bail!("Doctor found non-repairable issues; no changes were made");
+        bail!("Doctor found conflicts that require review; no changes were made");
     }
     let resolved = resolved.context("Doctor cannot repair unresolved desired state")?;
     if !yes && !confirm(scope_name, issues.len())? {
@@ -456,7 +449,14 @@ pub fn run(scope: InstallScope, machine: bool, repair: bool, yes: bool) -> Resul
         return Ok(());
     }
 
-    if migrated != inputs.manifest && inputs.unavailable_aliases.is_empty() {
+    if let InstallScope::Project(project_root) = &scope {
+        for message in crate::project_store::migrate_project_storage(project_root)? {
+            println!("{}", crate::output::HumanOutput::stdout().info(&message));
+        }
+    }
+    if (migrated != inputs.manifest || inputs.legacy_project_config)
+        && inputs.unavailable_aliases.is_empty()
+    {
         save_manifest(
             &scope,
             &inputs.config_path,
@@ -490,11 +490,11 @@ fn load_inputs(scope: &InstallScope) -> Result<Inputs> {
     let sync = sync_registered_catalogs_cached(&global_config)?;
     let unavailable_aliases = sync.unavailable_aliases();
     let catalogs = sync.catalogs;
-    let (config_path, mut manifest) = match scope {
+    let (config_path, mut manifest, legacy_project_config) = match scope {
         InstallScope::Project(project_root) => {
-            let path = project_root.join("skiller.config.json");
-            let manifest = read_json(&path).with_context(|| "run `skiller config` first")?;
-            (path, manifest)
+            let loaded = crate::project_store::load_project_config(project_root, false, true)
+                .with_context(|| "run `skiller config` first")?;
+            (loaded.path, loaded.manifest, loaded.legacy)
         }
         InstallScope::Global => (
             global_config_path()?,
@@ -503,6 +503,7 @@ fn load_inputs(scope: &InstallScope) -> Result<Inputs> {
                 skills: global_config.skills.clone(),
                 agents: global_config.agents.clone(),
             },
+            false,
         ),
     };
     validate_schema(manifest.version, "skill config")?;
@@ -532,6 +533,7 @@ fn load_inputs(scope: &InstallScope) -> Result<Inputs> {
         statuses: sync.statuses,
         unavailable_aliases,
         declared_counts,
+        legacy_project_config,
     })
 }
 
@@ -843,7 +845,12 @@ fn recommendation_commands(
     let scope_flag = if scope == "global" { " -g" } else { "" };
     let mut recommendations = Vec::new();
     let update_codes = ["update-available"];
-    let install_codes = ["missing-owned-skill", "ownership-drift", "projection-drift"];
+    let install_codes = [
+        "missing-owned-skill",
+        "ownership-drift",
+        "projection-drift",
+        "unowned-conflict",
+    ];
     if !catalog_status.is_empty()
         || issues
             .iter()
@@ -858,7 +865,7 @@ fn recommendation_commands(
         .any(|issue| install_codes.contains(&issue.code))
     {
         recommendations.push(format!(
-            "Run `skiller install{scope_flag}` to reconcile desired projections."
+            "Run `skiller install{scope_flag}`; matching existing skills are adopted automatically."
         ));
     }
     if issues.iter().any(|issue| {
@@ -946,6 +953,7 @@ mod tests {
             )]),
             unavailable_aliases: BTreeSet::from(["offline".to_owned()]),
             declared_counts: BTreeMap::from([("offline".to_owned(), 1)]),
+            legacy_project_config: false,
         };
         let state = InstalledState {
             version: INSTALLED_STATE_VERSION,
@@ -1076,9 +1084,23 @@ mod tests {
             recommendation_commands("global", &issues, &[]),
             vec![
                 "Run `skiller update -g` to refresh and review catalog updates.",
-                "Run `skiller install -g` to reconcile desired projections.",
+                "Run `skiller install -g`; matching existing skills are adopted automatically.",
                 "Run `skiller doctor -g --repair` to repair Skiller-owned state.",
             ]
+        );
+    }
+
+    #[test]
+    fn unowned_conflict_recommends_safe_adoption_and_exact_opt_out() {
+        let issues = vec![DoctorIssue {
+            code: "unowned-conflict",
+            message: "pyg/repetit conflicts with existing unowned repetit; matching content can be adopted, otherwise keep it with `skiller config --set pyg/repetit=off`"
+                .to_owned(),
+            fixable: false,
+        }];
+        assert_eq!(
+            recommendation_commands("project", &issues, &[]),
+            vec!["Run `skiller install`; matching existing skills are adopted automatically."]
         );
     }
 

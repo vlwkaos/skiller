@@ -1,3 +1,25 @@
+## [Unreleased]
+
+## [0.13.0] - 2026-09-15
+
+### Changed
+
+- Store one shared project policy under Git's common directory and separate installation state under each worktree's private Git directory.
+- Treat catalog-managed projections as disposable and overwrite owned drift instead of preserving project overrides or blocking catalog changes.
+- Print every configured root and its dependency ownership tree before installation mutation.
+- Import legacy root configuration and state once, remove safe untracked remnants, preserve tracked configuration for review, and stop reading it after migration.
+- Keep project configuration unavailable outside Git while opening Global configuration directly from bare `skiller`.
+- Open a Project or Global chooser from bare `skiller` and immediately reconcile interactive or scripted configuration changes.
+- Group Doctor ownership conflicts by skill and show exact safe-adoption or opt-out actions.
+- Show direct requirements, reverse dependents, and transitive same-scope install bundles in TUI and JSON output.
+
+## [0.11.1] - 2026-09-11
+
+### Fixed
+
+- Refresh registered catalogs before interactive or mutating configuration so newly published remote skills can be selected without a separate update cycle.
+- Explain stale catalog rows in configuration details and mutation errors instead of silently ignoring unavailable selection actions.
+
 ## [0.11.0] - 2026-08-27
 
 ### Features

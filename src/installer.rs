@@ -16,9 +16,9 @@ use crate::model::{
 };
 use crate::paths::{
     cache_root, copy_tree, ensure_real_dir, global_skills_root, global_state_path, output_bounded,
-    read_json, read_json_or_default, safe_remove_owned_dir, sanitize_child_output,
-    validate_managed_json_path, write_global_config, write_json_atomic, write_json_atomic_compact,
-    write_json_exclusive_compact,
+    project_state_root, read_json, read_json_or_default, safe_remove_owned_dir,
+    sanitize_child_output, validate_managed_json_path, write_global_config, write_json_atomic,
+    write_json_atomic_compact, write_json_exclusive_compact,
 };
 
 const VERCEL_SKILLS_PACKAGE: &str = "skills@1.5.23";
@@ -82,11 +82,7 @@ pub(crate) enum ProjectionStatus {
     Synced,
     Missing,
     Drift,
-    KeepLocal,
-    OrphanedLocal,
-    Conflict,
     Incoming,
-    Unknown,
 }
 
 impl ProjectionStatus {
@@ -95,11 +91,7 @@ impl ProjectionStatus {
             Self::Synced => "SYNCED",
             Self::Missing => "MISSING",
             Self::Drift => "DRIFT",
-            Self::KeepLocal => "KEEP LOCAL",
-            Self::OrphanedLocal => "ORPHANED",
-            Self::Conflict => "CONFLICT",
             Self::Incoming => "UPDATE",
-            Self::Unknown => "REVIEW",
         }
     }
 }
@@ -107,8 +99,6 @@ impl ProjectionStatus {
 struct ReconcileSelection {
     install_names: BTreeSet<String>,
     complete_names: BTreeSet<String>,
-    protected_names: BTreeSet<String>,
-    notices: Vec<String>,
     blocked: Vec<String>,
 }
 
@@ -135,10 +125,11 @@ pub fn install(scope: InstallScope) -> Result<()> {
     let catalogs = sync.catalogs;
     let (config_path, manifest) = match &scope {
         InstallScope::Project(project_root) => {
-            let path = project_root.join("skiller.config.json");
-            let manifest =
-                read_json(&path).with_context(|| "run `skiller config` before installing")?;
-            (Some(path), manifest)
+            let loaded = crate::project_store::load_project_config(project_root, true, true)?;
+            for message in loaded.migration {
+                println!("{}", output.info(&message));
+            }
+            (Some(loaded.path), loaded.manifest)
         }
         InstallScope::Global => (
             None,
@@ -228,6 +219,15 @@ pub(crate) fn install_with_catalogs_recovery(
     validate_owned_state(&previous, paths.state_prefix)?;
     let active_manifest = manifest_without_unavailable(manifest, unavailable_aliases);
     let resolved = resolve_manifest(&active_manifest, catalogs, scope.is_global())?;
+    println!("{}", output.info("Install plan"));
+    let plan = install_forest_lines(&active_manifest, catalogs, &resolved)?;
+    if plan.is_empty() {
+        println!("  (no configured skills)");
+    } else {
+        for line in plan {
+            println!("  {line}");
+        }
+    }
     let mut effective_replacement_owned = replacement_owned.clone();
     let mut effective_recovering = recovering;
     if let Some(journal) = &pending_journal {
@@ -358,7 +358,6 @@ pub(crate) fn install_with_catalogs_recovery(
             .iter()
             .filter(|(key, skill)| {
                 !preserved.contains_key(*key)
-                    && !selection.protected_names.contains(&skill.installed_name)
                     && !resolved
                         .iter()
                         .any(|desired| desired.installed_name == skill.installed_name)
@@ -366,9 +365,6 @@ pub(crate) fn install_with_catalogs_recovery(
             .map(|(_, skill)| skill.installed_name.clone())
             .chain(cleanup_owned.iter().cloned())
             .collect();
-        for notice in &selection.notices {
-            println!("{}", output.warning(notice));
-        }
         let mut complete_names = selection.complete_names;
         if !eligible.is_empty() || !removed.is_empty() {
             changed = true;
@@ -595,13 +591,16 @@ fn preflight_environment(paths: &InstallPaths, global_scope: bool) -> Result<Vec
 
 pub(crate) fn install_paths(scope: &InstallScope) -> Result<InstallPaths> {
     match scope {
-        InstallScope::Project(project_root) => Ok(InstallPaths {
-            state_path: project_root.join(".skiller/installed.json"),
-            transaction_path: project_root.join(".skiller/transaction.json"),
-            work_root: project_root.join(".skiller"),
-            command_root: project_root.clone(),
-            state_prefix: ".agents/skills",
-        }),
+        InstallScope::Project(project_root) => {
+            let state_root = project_state_root(project_root)?;
+            Ok(InstallPaths {
+                state_path: state_root.join("installed.json"),
+                transaction_path: state_root.join("transaction.json"),
+                work_root: state_root,
+                command_root: project_root.clone(),
+                state_prefix: ".agents/skills",
+            })
+        }
         InstallScope::Global => {
             let home = global_skills_root()?
                 .parent()
@@ -772,6 +771,91 @@ fn split_key(key: &str) -> Result<(&str, &str)> {
         .with_context(|| format!("invalid catalog skill identifier: {key}"))
 }
 
+fn install_forest_lines(
+    manifest: &ProjectConfig,
+    catalogs: &BTreeMap<String, CatalogIndex>,
+    resolved: &[ResolvedSkill<'_>],
+) -> Result<Vec<String>> {
+    let resolved_by_key: BTreeMap<_, _> = resolved
+        .iter()
+        .map(|skill| (skill.key.as_str(), skill))
+        .collect();
+    let mut lines = Vec::new();
+    for (key, selection) in &manifest.skills {
+        let Some(root) = resolved_by_key.get(key.as_str()) else {
+            continue;
+        };
+        lines.push(format!(
+            "{}  configured {}",
+            root.key,
+            selection_mode_label(selection.mode())
+        ));
+        append_dependency_lines(
+            &root.key,
+            root,
+            "  ",
+            manifest,
+            catalogs,
+            &resolved_by_key,
+            &mut lines,
+        )?;
+    }
+    Ok(lines)
+}
+
+fn append_dependency_lines(
+    parent_key: &str,
+    parent: &ResolvedSkill<'_>,
+    prefix: &str,
+    manifest: &ProjectConfig,
+    catalogs: &BTreeMap<String, CatalogIndex>,
+    resolved: &BTreeMap<&str, &ResolvedSkill<'_>>,
+    lines: &mut Vec<String>,
+) -> Result<()> {
+    let (alias, _) = split_key(parent_key)?;
+    let catalog = catalogs
+        .get(alias)
+        .with_context(|| format!("configuration references unregistered catalog: {alias}"))?;
+    let dependencies: Vec<_> = catalog.skills[&parent.source_name]
+        .requires
+        .iter()
+        .map(|name| format!("{alias}/{name}"))
+        .filter(|key| resolved.contains_key(key.as_str()))
+        .collect();
+    for (index, dependency_key) in dependencies.iter().enumerate() {
+        let last = index + 1 == dependencies.len();
+        let branch = if last { "└─" } else { "├─" };
+        let configured = manifest.skills.get(dependency_key).map(|selection| {
+            format!(
+                ", also configured {}",
+                selection_mode_label(selection.mode())
+            )
+        });
+        lines.push(format!(
+            "{prefix}{branch} {dependency_key}  required by {parent_key}{}",
+            configured.as_deref().unwrap_or_default()
+        ));
+        let child = resolved[dependency_key.as_str()];
+        append_dependency_lines(
+            dependency_key,
+            child,
+            &format!("{prefix}{} ", if last { "  " } else { "│ " }),
+            manifest,
+            catalogs,
+            resolved,
+            lines,
+        )?;
+    }
+    Ok(())
+}
+
+fn selection_mode_label(mode: SelectionMode) -> &'static str {
+    match mode {
+        SelectionMode::Enable => "Agent + Human",
+        SelectionMode::Manual => "Human only",
+    }
+}
+
 fn prepare_skills(resolved: &[ResolvedSkill<'_>], prepared_root: &Path) -> Result<()> {
     for skill in resolved {
         let source = skill.catalog.root.join("skills").join(&skill.source_name);
@@ -814,7 +898,17 @@ fn read_project_skills_lock(project_root: &Path) -> Result<Option<serde_json::Va
     Ok(Some(value))
 }
 
-fn is_skiller_lock_entry(entry: &serde_json::Value) -> bool {
+fn managed_lock_sources(project_root: &Path) -> Result<BTreeSet<String>> {
+    let current = project_state_root(project_root)?.join("prepared-current");
+    let mut sources = BTreeSet::from([".skiller/prepared-current".to_owned()]);
+    sources.insert(current.to_string_lossy().replace('\\', "/"));
+    if let Ok(relative) = current.strip_prefix(project_root) {
+        sources.insert(relative.to_string_lossy().replace('\\', "/"));
+    }
+    Ok(sources)
+}
+
+fn is_skiller_lock_entry(entry: &serde_json::Value, sources: &BTreeSet<String>) -> bool {
     if entry.get("sourceType").and_then(serde_json::Value::as_str) != Some("local") {
         return false;
     }
@@ -823,12 +917,13 @@ fn is_skiller_lock_entry(entry: &serde_json::Value) -> bool {
     };
     let normalized = source.replace('\\', "/");
     let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
-    normalized == ".skiller/prepared-current"
+    sources.contains(normalized)
 }
 
 fn managed_lock_names_in(
     value: &serde_json::Value,
     owned_names: &BTreeSet<String>,
+    sources: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>> {
     let skills = value
         .get("skills")
@@ -836,7 +931,9 @@ fn managed_lock_names_in(
         .context("project Skills lock has no skills object")?;
     Ok(skills
         .iter()
-        .filter(|(name, entry)| owned_names.contains(*name) && is_skiller_lock_entry(entry))
+        .filter(|(name, entry)| {
+            owned_names.contains(*name) && is_skiller_lock_entry(entry, sources)
+        })
         .map(|(name, _)| name.clone())
         .collect())
 }
@@ -848,7 +945,7 @@ pub(crate) fn managed_project_lock_names(
     let Some(value) = read_project_skills_lock(project_root)? else {
         return Ok(BTreeSet::new());
     };
-    managed_lock_names_in(&value, owned_names)
+    managed_lock_names_in(&value, owned_names, &managed_lock_sources(project_root)?)
 }
 
 fn partition_project_skills_lock(
@@ -858,7 +955,7 @@ fn partition_project_skills_lock(
     let Some(mut value) = read_project_skills_lock(project_root)? else {
         return Ok(false);
     };
-    let managed = managed_lock_names_in(&value, owned_names)?;
+    let managed = managed_lock_names_in(&value, owned_names, &managed_lock_sources(project_root)?)?;
     if managed.is_empty() {
         return Ok(false);
     }
@@ -1088,12 +1185,7 @@ fn checkpoint_state(
         });
         let intended_digest =
             directory_digest(&prepared_root.join("skills").join(&skill.installed_name))?;
-        let content_digest = previous
-            .skills
-            .get(&skill.key)
-            .filter(|installed| installed.digest.as_deref() == Some(&skill.digest))
-            .and_then(|installed| installed.content_digest.clone())
-            .unwrap_or(intended_digest);
+        let content_digest = intended_digest;
         skills.insert(
             skill.key.clone(),
             InstalledSkill {
@@ -1113,7 +1205,7 @@ fn checkpoint_state(
 }
 
 pub(crate) fn projection_status(
-    global_scope: bool,
+    _global_scope: bool,
     installed: &InstalledSkill,
     desired: Option<&ResolvedSkill<'_>>,
     actual: &Path,
@@ -1122,26 +1214,23 @@ pub(crate) fn projection_status(
         return Ok(ProjectionStatus::Missing);
     }
     let current = directory_digest(actual)?;
+    if installed
+        .content_digest
+        .as_ref()
+        .is_none_or(|baseline| baseline != &current)
+    {
+        return Ok(ProjectionStatus::Drift);
+    }
     let incoming = desired.is_some_and(|desired| {
         installed.installed_name != desired.installed_name
             || installed.mode != desired.mode
             || installed.gitignore != desired.gitignore
             || installed.digest.as_deref() != Some(&desired.digest)
     });
-    let Some(baseline) = &installed.content_digest else {
-        return Ok(match (global_scope, incoming) {
-            (true, true) => ProjectionStatus::Incoming,
-            (false, true) => ProjectionStatus::Conflict,
-            (_, false) => ProjectionStatus::Unknown,
-        });
-    };
-    let local = baseline != &current;
-    Ok(match (global_scope, local, incoming) {
-        (true, true, _) => ProjectionStatus::Drift,
-        (_, true, true) => ProjectionStatus::Conflict,
-        (false, true, false) => ProjectionStatus::KeepLocal,
-        (_, false, true) => ProjectionStatus::Incoming,
-        (_, false, false) => ProjectionStatus::Synced,
+    Ok(if incoming {
+        ProjectionStatus::Incoming
+    } else {
+        ProjectionStatus::Synced
     })
 }
 
@@ -1180,42 +1269,10 @@ fn classify_reconciliation(
     let mut selection = ReconcileSelection {
         install_names: BTreeSet::new(),
         complete_names: BTreeSet::new(),
-        protected_names: BTreeSet::new(),
-        notices: Vec::new(),
         blocked: Vec::new(),
     };
-    if !global_scope {
-        for (key, installed) in &previous.skills {
-            if resolved
-                .iter()
-                .any(|skill| skill.installed_name == installed.installed_name)
-            {
-                continue;
-            }
-            let actual = roots[0].join(&installed.installed_name);
-            let current = actual
-                .is_dir()
-                .then(|| directory_digest(&actual))
-                .transpose()?;
-            let locally_changed = match (&installed.content_digest, current) {
-                (Some(baseline), Some(current)) => baseline != &current,
-                (None, Some(_)) => true,
-                _ => false,
-            };
-            if locally_changed {
-                selection
-                    .protected_names
-                    .insert(installed.installed_name.clone());
-                selection.blocked.push(format!(
-                    "[orphaned-local] {key} has project changes; keeping {} unchanged",
-                    installed.installed_name
-                ));
-            }
-        }
-    }
     for skill in resolved {
         let intended = prepared_root.join("skills").join(&skill.installed_name);
-        let intended_digest = directory_digest(&intended)?;
         let existing: Vec<_> = roots
             .iter()
             .map(|root| root.join(&skill.installed_name))
@@ -1237,52 +1294,7 @@ fn classify_reconciliation(
                 && installed.gitignore == skill.gitignore
                 && installed.digest.as_deref() == Some(&skill.digest)
         });
-        let current_project_digest = if !global_scope {
-            installed
-                .map(|installed| roots[0].join(&installed.installed_name))
-                .filter(|actual| actual.is_dir())
-                .map(|actual| directory_digest(&actual))
-                .transpose()?
-        } else {
-            None
-        };
-        let local_project_change = installed.is_some_and(|installed| {
-            match (&installed.content_digest, &current_project_digest) {
-                (Some(baseline), Some(current)) => baseline != current,
-                (None, Some(current)) if state_current => current != &intended_digest,
-                (None, Some(_)) => true,
-                _ => false,
-            }
-        });
-        if !global_scope
-            && owned.contains(&skill.installed_name)
-            && all_agents_have
-            && !existing.is_empty()
-            && all_existing_match
-        {
-            selection
-                .complete_names
-                .insert(skill.installed_name.clone());
-        } else if local_project_change {
-            selection
-                .protected_names
-                .insert(skill.installed_name.clone());
-            selection
-                .complete_names
-                .insert(skill.installed_name.clone());
-            if state_current {
-                selection.notices.push(format!(
-                    "[keep-local] {} has project changes; keeping it unchanged",
-                    skill.key
-                ));
-            } else {
-                selection.complete_names.remove(&skill.installed_name);
-                selection.blocked.push(format!(
-                    "[project-conflict] {} has both project and catalog changes; keeping it unchanged",
-                    skill.key
-                ));
-            }
-        } else if owned.contains(&skill.installed_name) {
+        if owned.contains(&skill.installed_name) {
             if state_current && all_agents_have && !existing.is_empty() && all_existing_match {
                 selection
                     .complete_names
@@ -1306,7 +1318,10 @@ fn classify_reconciliation(
             }
         } else {
             selection.blocked.push(format!(
-                "[unowned-conflict] {} has divergent or unverifiable unowned projections",
+                "[unowned-conflict] {} differs from existing unowned {}; kept existing content. To keep it, run `skiller config{} --set {}=off`",
+                skill.key,
+                skill.installed_name,
+                if global_scope { " -g" } else { "" },
                 skill.key
             ));
         }
@@ -1516,7 +1531,6 @@ fn update_gitignore(project_root: &Path, state: &InstalledState) -> Result<()> {
         kept.push(String::new());
     }
     kept.push(IGNORE_START.to_owned());
-    kept.push("/.skiller/".to_owned());
     for skill in state.skills.values().filter(|skill| skill.gitignore) {
         kept.push(format!("/**/skills/{}", skill.installed_name));
     }
@@ -1531,6 +1545,17 @@ mod tests {
     use crate::model::{
         CatalogMetadata, EffectiveMode, GlobalConfig, SCHEMA_VERSION, SkillSelection,
     };
+
+    fn init_git(root: &Path) {
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
 
     fn catalog(global: bool) -> CatalogIndex {
         CatalogIndex {
@@ -1612,6 +1637,34 @@ mod tests {
     }
 
     #[test]
+    fn install_forest_lists_every_root_and_dependency_owner() {
+        let catalogs = BTreeMap::from([("pyg".to_owned(), catalog(true))]);
+        let manifest = ProjectConfig {
+            version: SCHEMA_VERSION,
+            skills: BTreeMap::from([
+                (
+                    "pyg/root".to_owned(),
+                    SkillSelection::Mode(SelectionMode::Enable),
+                ),
+                (
+                    "pyg/dependency".to_owned(),
+                    SkillSelection::Mode(SelectionMode::Manual),
+                ),
+            ]),
+            agents: crate::model::default_agents(),
+        };
+        let resolved = resolve_manifest(&manifest, &catalogs, true).unwrap();
+        assert_eq!(
+            install_forest_lines(&manifest, &catalogs, &resolved).unwrap(),
+            vec![
+                "pyg/dependency  configured Human only",
+                "pyg/root  configured Agent + Human",
+                "  └─ pyg/dependency  required by pyg/root, also configured Human only",
+            ]
+        );
+    }
+
+    #[test]
     fn unavailable_catalog_filter_keeps_declarations_out_of_reconciliation() {
         let manifest = ProjectConfig {
             version: SCHEMA_VERSION,
@@ -1684,7 +1737,64 @@ mod tests {
     }
 
     #[test]
-    fn project_overrides_are_preserved_and_catalog_changes_conflict() {
+    fn unowned_projection_is_adopted_only_when_identical() {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/unowned-adoption");
+        let _ = std::fs::remove_dir_all(&base);
+        let actual = base.join(".agents/skills/root");
+        let intended = base.join("prepared/skills/root");
+        std::fs::create_dir_all(&actual).unwrap();
+        std::fs::create_dir_all(&intended).unwrap();
+        std::fs::write(actual.join("SKILL.md"), "same").unwrap();
+        std::fs::write(intended.join("SKILL.md"), "same").unwrap();
+
+        let catalog = catalog(false);
+        let resolved = vec![ResolvedSkill {
+            key: "pyg/root".to_owned(),
+            catalog: &catalog,
+            source_name: "root".to_owned(),
+            installed_name: "root".to_owned(),
+            mode: EffectiveMode::Enable,
+            gitignore: false,
+            digest: "catalog-v1".to_owned(),
+        }];
+        let adopted = classify_reconciliation(
+            &base,
+            false,
+            &InstalledState::default(),
+            &resolved,
+            &BTreeSet::new(),
+            &["universal".to_owned()],
+            &base.join("prepared"),
+        )
+        .unwrap();
+        assert!(adopted.complete_names.contains("root"));
+        assert!(adopted.blocked.is_empty());
+
+        std::fs::write(actual.join("SKILL.md"), "local work").unwrap();
+        let blocked = classify_reconciliation(
+            &base,
+            false,
+            &InstalledState::default(),
+            &resolved,
+            &BTreeSet::new(),
+            &["universal".to_owned()],
+            &base.join("prepared"),
+        )
+        .unwrap();
+        assert!(blocked.complete_names.is_empty());
+        assert_eq!(
+            blocked.blocked,
+            vec![
+                "[unowned-conflict] pyg/root differs from existing unowned root; kept existing content. To keep it, run `skiller config --set pyg/root=off`"
+            ]
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn owned_project_drift_is_always_scheduled_for_authoritative_overwrite() {
         let base = std::env::current_dir()
             .unwrap()
             .join("target/test-work/project-overrides");
@@ -1722,7 +1832,7 @@ mod tests {
                 },
             )]),
         };
-        let preserved = classify_reconciliation(
+        let drifted = classify_reconciliation(
             &base,
             false,
             &previous,
@@ -1732,13 +1842,12 @@ mod tests {
             &base.join("prepared"),
         )
         .unwrap();
-        assert!(preserved.install_names.is_empty());
-        assert!(preserved.complete_names.contains("root"));
-        assert_eq!(preserved.notices.len(), 1);
-        assert!(preserved.blocked.is_empty());
+        assert!(drifted.install_names.contains("root"));
+        assert!(drifted.complete_names.is_empty());
+        assert!(drifted.blocked.is_empty());
 
         previous.skills.get_mut("pyg/root").unwrap().digest = Some("catalog-v0".to_owned());
-        let conflicted = classify_reconciliation(
+        let catalog_and_project_drift = classify_reconciliation(
             &base,
             false,
             &previous,
@@ -1748,9 +1857,8 @@ mod tests {
             &base.join("prepared"),
         )
         .unwrap();
-        assert!(conflicted.install_names.is_empty());
-        assert!(conflicted.complete_names.is_empty());
-        assert!(conflicted.blocked[0].contains("project-conflict"));
+        assert!(catalog_and_project_drift.install_names.contains("root"));
+        assert!(catalog_and_project_drift.blocked.is_empty());
 
         previous.skills.get_mut("pyg/root").unwrap().digest = Some("catalog-v1".to_owned());
         resolved[0].digest = "catalog-v2".to_owned();
@@ -1780,14 +1888,14 @@ mod tests {
             &base.join("prepared"),
         )
         .unwrap();
-        assert!(resolved_manually.install_names.is_empty());
-        assert!(resolved_manually.complete_names.contains("root"));
+        assert!(resolved_manually.install_names.contains("root"));
+        assert!(resolved_manually.complete_names.is_empty());
         assert!(resolved_manually.blocked.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
-    fn removed_project_override_is_protected() {
+    fn removed_owned_projection_is_not_protected() {
         let base = std::env::current_dir()
             .unwrap()
             .join("target/test-work/orphaned-project-override");
@@ -1819,8 +1927,9 @@ mod tests {
             &base.join("prepared"),
         )
         .unwrap();
-        assert!(selection.protected_names.contains("retired"));
-        assert!(selection.blocked[0].contains("orphaned-local"));
+        assert!(selection.complete_names.is_empty());
+        assert!(selection.install_names.is_empty());
+        assert!(selection.blocked.is_empty());
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -1831,6 +1940,12 @@ mod tests {
             .join("target/test-work/project-lock-partition");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        init_git(&root);
+        let current_source = project_state_root(&root)
+            .unwrap()
+            .join("prepared-current")
+            .display()
+            .to_string();
         let lock = serde_json::json!({
             "version": 1,
             "skills": {
@@ -1838,6 +1953,11 @@ mod tests {
                     "source": "./.skiller/prepared-current",
                     "sourceType": "local",
                     "computedHash": "managed"
+                },
+                "catalog-current": {
+                    "source": current_source,
+                    "sourceType": "local",
+                    "computedHash": "managed-current"
                 },
                 "native-skill": {
                     "source": "owner/native-skills",
@@ -1848,20 +1968,35 @@ mod tests {
                     "source": "./project-skills",
                     "sourceType": "local",
                     "computedHash": "local"
+                },
+                "native-lookalike": {
+                    "source": "/unrelated/skiller/prepared-current",
+                    "sourceType": "local",
+                    "computedHash": "lookalike"
                 }
             }
         });
         write_json_atomic(&root.join("skills-lock.json"), &lock).unwrap();
-        let owned = BTreeSet::from(["catalog-skill".to_owned(), "native-local".to_owned()]);
+        let owned = BTreeSet::from([
+            "catalog-skill".to_owned(),
+            "catalog-current".to_owned(),
+            "native-local".to_owned(),
+            "native-lookalike".to_owned(),
+        ]);
         assert_eq!(
             managed_project_lock_names(&root, &owned).unwrap(),
-            BTreeSet::from(["catalog-skill".to_owned()])
+            BTreeSet::from(["catalog-current".to_owned(), "catalog-skill".to_owned()])
         );
         assert!(partition_project_skills_lock(&root, &owned).unwrap());
         let cleaned: serde_json::Value = read_json(&root.join("skills-lock.json")).unwrap();
         assert!(cleaned["skills"].get("catalog-skill").is_none());
+        assert!(cleaned["skills"].get("catalog-current").is_none());
         assert_eq!(cleaned["skills"]["native-skill"]["computedHash"], "native");
         assert_eq!(cleaned["skills"]["native-local"]["computedHash"], "local");
+        assert_eq!(
+            cleaned["skills"]["native-lookalike"]["computedHash"],
+            "lookalike"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1872,6 +2007,7 @@ mod tests {
             .join("target/test-work/project-lock-failed-action");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        init_git(&root);
         let owned = BTreeSet::from(["catalog-skill".to_owned()]);
         let error = run_vercel_partitioning_project_lock(Some(&root), &owned, || {
             write_json_atomic(
@@ -1909,6 +2045,7 @@ mod tests {
             .join("target/test-work/project-lock-catalog-only");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        init_git(&root);
         write_json_atomic(
             &root.join("skills-lock.json"),
             &serde_json::json!({

@@ -96,23 +96,43 @@ pub fn global_skills_root() -> Result<PathBuf> {
     Ok(home_dir()?.join(".agents/skills"))
 }
 
+fn git_path(project_root: &Path, argument: &str, label: &str) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", argument])
+        .current_dir(project_root)
+        .output()
+        .with_context(|| format!("resolving {label}"))?;
+    if !output.status.success() {
+        bail!("project configuration requires a Git repository");
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if value.is_empty() {
+        bail!("Git returned an empty {label}");
+    }
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        project_root.join(path)
+    };
+    path.canonicalize()
+        .with_context(|| format!("resolving {label} at {}", path.display()))
+}
+
 pub fn project_root() -> Result<PathBuf> {
     let cwd = env::current_dir().context("reading current directory")?;
-    let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(&cwd)
-        .output();
-    if let Ok(output) = output
-        && output.status.success()
-    {
-        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if !value.is_empty() {
-            return PathBuf::from(value)
-                .canonicalize()
-                .context("resolving Git project root");
-        }
-    }
-    cwd.canonicalize().context("resolving project root")
+    git_path(&cwd, "--show-toplevel", "Git project root")
+}
+
+pub(crate) fn project_config_path(project_root: &Path) -> Result<PathBuf> {
+    Ok(
+        git_path(project_root, "--git-common-dir", "Git common directory")?
+            .join("skiller/config.json"),
+    )
+}
+
+pub(crate) fn project_state_root(project_root: &Path) -> Result<PathBuf> {
+    Ok(git_path(project_root, "--git-dir", "Git directory")?.join("skiller"))
 }
 
 pub fn read_json_or_default<T>(path: &Path) -> Result<T>
@@ -416,5 +436,57 @@ mod tests {
             sanitize_child_output(b"ok\n\x1b]8;;bad\x07link"),
             "ok\n�]8;;bad�link"
         );
+    }
+
+    #[test]
+    fn linked_worktrees_share_policy_but_not_installation_state() {
+        let base = std::env::current_dir()
+            .unwrap()
+            .join("target/test-work/git-storage-scope");
+        let repository = base.join("repository");
+        let worktree = base.join("linked");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&repository).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Skiller Test",
+                    "-c",
+                    "user.email=test@example.invalid"
+                ])
+                .args(["commit", "--allow-empty", "-m", "initial"])
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["worktree", "add", "-b", "linked-test"])
+                .arg(&worktree)
+                .current_dir(&repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert_eq!(
+            project_config_path(&repository).unwrap(),
+            project_config_path(&worktree).unwrap()
+        );
+        assert_ne!(
+            project_state_root(&repository).unwrap(),
+            project_state_root(&worktree).unwrap()
+        );
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

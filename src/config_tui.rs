@@ -26,6 +26,19 @@ pub(crate) enum ConfigTuiResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigurationScope {
+    Project,
+    Global,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopePickerAction {
+    Continue,
+    Open(ConfigurationScope),
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigScreen {
     Scopes,
     Skills,
@@ -67,6 +80,110 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
+    }
+}
+
+pub(crate) fn choose_configuration_scope() -> Result<Option<ConfigurationScope>> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("configuration scope selection requires a terminal");
+    }
+    enable_raw_mode().context("enabling terminal raw mode")?;
+    let _guard = TerminalGuard;
+    execute!(io::stdout(), EnterAlternateScreen, Hide).context("opening scope selection")?;
+    let mut selected = ConfigurationScope::Project;
+
+    loop {
+        let (width, height) = size().context("reading terminal size")?;
+        let lines = configuration_scope_lines(selected, width as usize, height as usize);
+        let mut output = io::stdout();
+        write_frame(
+            &mut output,
+            &lines,
+            ConfigTuiState::default(),
+            crate::output::color_enabled(true),
+        )?;
+        output.flush()?;
+
+        let Event::Key(key) = read().context("reading terminal input")? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match handle_scope_picker_key(&mut selected, key.code) {
+            ScopePickerAction::Continue => {}
+            ScopePickerAction::Open(scope) => return Ok(Some(scope)),
+            ScopePickerAction::Cancel => return Ok(None),
+        }
+    }
+}
+
+fn handle_scope_picker_key(selected: &mut ConfigurationScope, key: KeyCode) -> ScopePickerAction {
+    match key {
+        KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k') | KeyCode::Tab => {
+            *selected = match selected {
+                ConfigurationScope::Project => ConfigurationScope::Global,
+                ConfigurationScope::Global => ConfigurationScope::Project,
+            };
+            ScopePickerAction::Continue
+        }
+        KeyCode::Enter => ScopePickerAction::Open(*selected),
+        KeyCode::Esc | KeyCode::Char('q') => ScopePickerAction::Cancel,
+        _ => ScopePickerAction::Continue,
+    }
+}
+
+fn configuration_scope_lines(
+    selected: ConfigurationScope,
+    width: usize,
+    height: usize,
+) -> Vec<String> {
+    let width = width.max(1);
+    let height = height.max(1);
+    let marker = |scope| if selected == scope { '›' } else { ' ' };
+    let choices = [
+        fit(
+            &format!(
+                "{} Project  Skills for the current project",
+                marker(ConfigurationScope::Project)
+            ),
+            width,
+        ),
+        fit(
+            &format!(
+                "{} Global   Skills available on this device",
+                marker(ConfigurationScope::Global)
+            ),
+            width,
+        ),
+    ];
+    match height {
+        1 => vec![fit(
+            match selected {
+                ConfigurationScope::Project => "Skiller Configuration  Project",
+                ConfigurationScope::Global => "Skiller Configuration  Global",
+            },
+            width,
+        )],
+        2 => choices.into(),
+        3 => vec![
+            fit("Skiller Configuration", width),
+            choices[0].clone(),
+            choices[1].clone(),
+        ],
+        4 => vec![
+            fit("Skiller Configuration", width),
+            fit("Choose where to configure and install skills.", width),
+            choices[0].clone(),
+            choices[1].clone(),
+        ],
+        _ => vec![
+            fit("Skiller Configuration", width),
+            fit("Choose where to configure and install skills.", width),
+            choices[0].clone(),
+            choices[1].clone(),
+            fit("[↑/↓] Navigate  [Enter] Open  [Esc] Cancel", width),
+        ],
     }
 }
 
@@ -310,13 +427,16 @@ fn segment_color(segment: &str, state: ConfigTuiState) -> Option<Color> {
             crate::output::MUTED
         });
     }
-    if matches!(segment, "Details" | "Description" | "Installed") {
+    if matches!(
+        segment,
+        "Details" | "Description" | "Requires" | "Installs with" | "Installed"
+    ) {
         return Some(crate::output::ACCENT);
     }
     if segment == "Recommended" || segment.contains('★') {
         return Some(crate::output::WARNING);
     }
-    if segment == "Required" || segment.contains("Required by") || segment.contains('↳') {
+    if segment.contains("Required by") || segment.contains('↳') {
         return Some(crate::output::WARNING);
     }
     if segment.contains("CONFLICT") || segment.contains("ORPHANED") {
@@ -349,7 +469,13 @@ fn is_heading(segment: &str) -> bool {
         || segment.starts_with("Skills")
         || matches!(
             segment,
-            "Details" | "Description" | "Recommended" | "Required" | "Installed"
+            "Details"
+                | "Description"
+                | "Recommended"
+                | "Requires"
+                | "Installs with"
+                | "Required by"
+                | "Installed"
         )
 }
 
@@ -785,14 +911,27 @@ fn aligned_row(marker: char, label: &str, value: &str, width: usize) -> String {
 fn detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
     let mut lines = vec!["Description".to_owned()];
     lines.extend(wrap(&row.description, width, 2));
+    if let Some(reason) = &row.read_only_reason {
+        lines.push(String::new());
+        lines.push("Availability".to_owned());
+        lines.extend(wrap(reason, width, 3));
+    }
     if !row.recommended_by.is_empty() {
         lines.push(String::new());
         lines.push("Recommended".to_owned());
         lines.extend(wrap(&row.recommended_by.join(", "), width, 2));
     }
     lines.push(String::new());
-    lines.push("Required".to_owned());
-    lines.extend(wrap(&required_state(row), width, 2));
+    lines.push("Requires".to_owned());
+    lines.extend(wrap(&dependency_state(&row.requires), width, 2));
+    if !row.installs_with.is_empty() {
+        lines.push(String::new());
+        lines.push("Installs with".to_owned());
+        lines.extend(wrap(&row.installs_with.join(", "), width, 2));
+    }
+    lines.push(String::new());
+    lines.push("Required by".to_owned());
+    lines.extend(wrap(&required_by_state(row), width, 2));
     lines.push(String::new());
     lines.push("Installed".to_owned());
     lines.extend(wrap(&installed_state(row), width, 2));
@@ -802,11 +941,18 @@ fn detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
 fn stacked_detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut details = vec![("Description", row.description.clone())];
+    if let Some(reason) = &row.read_only_reason {
+        details.push(("Availability", reason.clone()));
+    }
     if !row.recommended_by.is_empty() {
         details.push(("Recommended", row.recommended_by.join(", ")));
     }
+    details.push(("Requires", dependency_state(&row.requires)));
+    if !row.installs_with.is_empty() {
+        details.push(("Installs with", row.installs_with.join(", ")));
+    }
     details.extend([
-        ("Required", required_state(row)),
+        ("Required by", required_by_state(row)),
         ("Installed", installed_state(row)),
     ]);
     for (label, value) in details {
@@ -815,12 +961,16 @@ fn stacked_detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
     lines
 }
 
-fn required_state(row: &ConfigRow) -> String {
-    if row.required_by.is_empty() {
+fn dependency_state(dependencies: &[String]) -> String {
+    if dependencies.is_empty() {
         "None".to_owned()
     } else {
-        format!("By {}", row.required_by.join(", "))
+        dependencies.join(", ")
     }
+}
+
+fn required_by_state(row: &ConfigRow) -> String {
+    dependency_state(&row.required_by)
 }
 
 fn configured_state(row: &ConfigRow, manifest: &ProjectConfig) -> String {
@@ -864,18 +1014,6 @@ fn installed_state(row: &ConfigRow) -> String {
                 .map_or_else(|| "Read-only".to_owned(), str::to_uppercase),
         );
     }
-    if let Some(path) = row.authoring.as_deref()
-        && matches!(
-            row.sync,
-            Some(
-                crate::installer::ProjectionStatus::KeepLocal
-                    | crate::installer::ProjectionStatus::Conflict
-                    | crate::installer::ProjectionStatus::OrphanedLocal
-            )
-        )
-    {
-        parts.push(format!("Promote via {path}"));
-    }
     parts.join(" · ")
 }
 
@@ -915,6 +1053,9 @@ fn key_hint(
                     hints.push("[I] Git-ignore");
                     compact.push("[I] Ignore");
                 }
+            } else if row.is_some_and(|row| row.read_only_reason.is_some()) {
+                hints.push("[Read-only: catalog stale]");
+                compact.push("[Read-only]");
             }
             hints.extend([save, "[Esc] Scopes"]);
             compact.extend([save, "[Esc] Scopes"]);
@@ -1017,6 +1158,8 @@ mod tests {
             name: name.to_owned(),
             installed_name: name.to_owned(),
             description: format!("Configure {name}"),
+            requires: Vec::new(),
+            installs_with: Vec::new(),
             selected: None,
             gitignore: false,
             installed,
@@ -1025,6 +1168,7 @@ mod tests {
             recommended_by: Vec::new(),
             read_only: false,
             status: None,
+            read_only_reason: None,
             sync: None,
             authoring: None,
         }
@@ -1036,6 +1180,40 @@ mod tests {
             scope,
             skill,
         }
+    }
+
+    #[test]
+    fn scope_picker_is_keyboard_discoverable_and_width_bounded() {
+        let lines = configuration_scope_lines(ConfigurationScope::Project, 52, 5);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("› Project"));
+        assert!(rendered.contains("  Global"));
+        assert!(rendered.contains("[Enter] Open"));
+        assert!(lines.iter().all(|line| line.width() <= 52));
+
+        let tiny = configuration_scope_lines(ConfigurationScope::Global, 12, 2);
+        assert_eq!(tiny.len(), 2);
+        assert!(tiny[0].contains("Project"));
+        assert!(tiny[1].contains("Global"));
+        assert!(tiny.iter().all(|line| line.width() <= 12));
+    }
+
+    #[test]
+    fn scope_picker_keys_navigate_open_and_cancel() {
+        let mut selected = ConfigurationScope::Project;
+        assert_eq!(
+            handle_scope_picker_key(&mut selected, KeyCode::Down),
+            ScopePickerAction::Continue
+        );
+        assert_eq!(selected, ConfigurationScope::Global);
+        assert_eq!(
+            handle_scope_picker_key(&mut selected, KeyCode::Enter),
+            ScopePickerAction::Open(ConfigurationScope::Global)
+        );
+        assert_eq!(
+            handle_scope_picker_key(&mut selected, KeyCode::Esc),
+            ScopePickerAction::Cancel
+        );
     }
 
     #[test]
@@ -1161,6 +1339,8 @@ mod tests {
             row("develop", "engineering", true),
             row("simplify", "engineering", false),
         ];
+        rows[0].requires = vec!["recall".to_owned(), "simplify".to_owned()];
+        rows[0].installs_with = vec!["gh-pr".to_owned(), "ko-reader-brief".to_owned()];
         rows[0].required_by = vec!["release".to_owned(), "skiller".to_owned()];
         let mut manifest = ProjectConfig {
             version: SCHEMA_VERSION,
@@ -1185,7 +1365,12 @@ mod tests {
         assert!(!rendered.contains("Config  "));
         assert!(rendered.contains("│ Details"));
         assert!(rendered.contains("Description"));
-        assert!(rendered.contains("By release, skiller"));
+        assert!(rendered.contains("Requires"));
+        assert!(rendered.contains("recall, simplify"));
+        assert!(rendered.contains("Installs with"));
+        assert!(rendered.contains("gh-pr, ko-reader-brief"));
+        assert!(rendered.contains("Required by"));
+        assert!(rendered.contains("release, skiller"));
         assert!(rendered.contains("Agent + Human as develop"));
         assert!(lines.iter().all(|line| line.width() <= 100));
     }
@@ -1245,7 +1430,10 @@ mod tests {
 
     #[test]
     fn narrow_skill_view_keeps_rows_single_line_and_stacks_selected_details() {
-        let rows = vec![row("develop", "engineering", true)];
+        let mut develop = row("develop", "engineering", true);
+        develop.requires = vec!["recall".to_owned()];
+        develop.installs_with = vec!["gh-pr".to_owned(), "ko-reader-brief".to_owned()];
+        let rows = vec![develop];
         let lines = view_lines(
             &rows,
             &ProjectConfig::default(),
@@ -1262,16 +1450,48 @@ mod tests {
                 .any(|line| line.starts_with("› develop") && line.contains("○ Off"))
         );
         assert!(rendered.contains("Description: Configure develop"));
-        assert!(rendered.contains("Required: None"));
+        assert!(rendered.contains("Requires: recall"));
+        assert!(rendered.contains("Installs with: gh-pr, ko-reader-brief"));
+        assert!(rendered.contains("Required by: None"));
         assert!(rendered.contains("Installed: Agent + Human as develop"));
         assert!(lines.iter().all(|line| line.width() <= 52));
     }
 
     #[test]
-    fn divergent_project_rows_show_status_and_no_mutation_hint() {
+    fn stale_skill_explains_read_only_state_and_ignores_space() {
+        let mut stale = row("intrafetch", "kakao", false);
+        stale.catalog = "kakao".to_owned();
+        stale.key = "kakao/intrafetch".to_owned();
+        stale.read_only = true;
+        stale.status = Some("stale".to_owned());
+        stale.read_only_reason = Some(
+            "Catalog refresh failed: network unavailable. Restore source access and reopen config."
+                .to_owned(),
+        );
+        let rows = vec![stale];
+        let mut manifest = ProjectConfig::default();
+        let mut position = state(ConfigScreen::Skills, 0, 0);
+        handle_key(
+            &rows,
+            &mut manifest,
+            false,
+            &mut position,
+            KeyCode::Char(' '),
+        );
+        assert!(manifest.skills.is_empty());
+
+        let rendered = view_lines(&rows, &manifest, false, position, 100, 18).join("\n");
+        assert!(rendered.contains("Availability"));
+        assert!(rendered.contains("Catalog refresh failed:"));
+        assert!(rendered.contains("unavailable. Restore source access"));
+        assert!(rendered.contains("[Read-only: catalog stale]"));
+        assert!(!rendered.contains("[Space] Mode"));
+    }
+
+    #[test]
+    fn divergent_project_rows_remain_editable_and_show_drift() {
         let mut divergent = row("develop", "engineering", true);
-        divergent.sync = Some(crate::installer::ProjectionStatus::KeepLocal);
-        divergent.authoring = Some("/catalog/skills/develop".to_owned());
+        divergent.sync = Some(crate::installer::ProjectionStatus::Drift);
         let lines = view_lines(
             &[divergent],
             &ProjectConfig::default(),
@@ -1281,23 +1501,21 @@ mod tests {
             18,
         );
         let rendered = lines.join("\n");
-        assert!(rendered.contains("KEEP LOCAL"));
-        assert!(rendered.contains("/catalog/skills/develop"));
-        assert!(!rendered.contains("[Space] Mode"));
-        assert!(!rendered.contains("[I] Git-ignore"));
+        assert!(rendered.contains("DRIFT"));
+        assert!(rendered.contains("[Space] Mode"));
         assert!(rendered.contains("[S] Save"));
         assert!(rendered.contains("[Esc] Scopes"));
     }
 
     #[test]
-    fn orphaned_local_detail_prefers_sync_state_over_generic_read_only_state() {
-        let mut orphaned = row("retired", "other", true);
-        orphaned.read_only = true;
-        orphaned.status = Some("orphaned".to_owned());
-        orphaned.sync = Some(crate::installer::ProjectionStatus::OrphanedLocal);
-        let installed = installed_state(&orphaned);
-        assert!(installed.contains("ORPHANED"));
-        assert!(!installed.contains("STALE"));
+    fn obsolete_detail_prefers_sync_state_over_generic_read_only_state() {
+        let mut obsolete = row("retired", "other", true);
+        obsolete.read_only = true;
+        obsolete.status = Some("obsolete".to_owned());
+        obsolete.sync = Some(crate::installer::ProjectionStatus::Drift);
+        let installed = installed_state(&obsolete);
+        assert!(installed.contains("DRIFT"));
+        assert!(!installed.contains("OBSOLETE"));
     }
 
     #[test]

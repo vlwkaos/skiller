@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::catalog::{
     CatalogAvailability, CatalogIndex, CatalogStatus, load_global_config,
-    sync_registered_catalogs_cached,
+    sync_registered_catalogs_cached, sync_registered_catalogs_resilient,
 };
 use crate::installer::{
     InstallScope, ProjectionStatus, ResolvedSkill, projection_status, resolve_manifest,
@@ -33,6 +33,10 @@ pub(crate) struct ConfigRow {
     pub(crate) name: String,
     pub(crate) installed_name: String,
     pub(crate) description: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) requires: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) installs_with: Vec<String>,
     #[serde(rename = "want", skip_serializing_if = "Option::is_none")]
     pub(crate) selected: Option<SelectionMode>,
     #[serde(skip_serializing_if = "is_false")]
@@ -49,6 +53,8 @@ pub(crate) struct ConfigRow {
     pub(crate) read_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) read_only_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) sync: Option<ProjectionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +84,10 @@ struct PrintedSkill<'a> {
     installed_name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    requires: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    installs_with: &'a Vec<String>,
     #[serde(rename = "want", skip_serializing_if = "Option::is_none")]
     selected: Option<SelectionMode>,
     #[serde(skip_serializing_if = "is_false")]
@@ -92,6 +102,8 @@ struct PrintedSkill<'a> {
     read_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_only_reason: Option<&'a str>,
     #[serde(skip_serializing_if = "sync_is_default")]
     sync: Option<ProjectionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,6 +127,8 @@ fn printed_skill(row: &ConfigRow) -> PrintedSkill<'_> {
         installed_name: (row.installed_name != row.name).then_some(row.installed_name.as_str()),
         description: (!row.installed || row.selected.is_none() || attention)
             .then_some(row.description.as_str()),
+        requires: &row.requires,
+        installs_with: &row.installs_with,
         selected: row.selected,
         gitignore: row.gitignore,
         installed_mode: row.installed_mode,
@@ -122,6 +136,7 @@ fn printed_skill(row: &ConfigRow) -> PrintedSkill<'_> {
         recommended_by: &row.recommended_by,
         read_only: row.read_only,
         status: row.status.as_deref(),
+        read_only_reason: row.read_only_reason.as_deref(),
         sync: row.sync,
         authoring: row.authoring.as_deref(),
     }
@@ -159,18 +174,29 @@ pub fn configure(
     if global_config.catalogs.is_empty() {
         anyhow::bail!("no catalogs configured; run `skiller catalog configure <alias> <source>`");
     }
-    let read_only = machine && assignments.is_empty() && agents.is_empty();
-    let sync = sync_registered_catalogs_cached(&global_config)?;
+    let read_only = config_is_read_only(machine, assignments, agents);
+    // ^ README.md#commands defines the cache-only inspection and explicit refresh boundary.
+    let sync = if read_only {
+        sync_registered_catalogs_cached(&global_config)?
+    } else {
+        sync_registered_catalogs_resilient(&global_config)?
+    };
+    if !read_only {
+        let output = crate::output::HumanOutput::stderr();
+        for warning in refresh_warnings(&sync.statuses) {
+            eprintln!("{}", output.warning(&warning));
+        }
+    }
     let catalogs = sync.catalogs.clone();
     let (config_path, state_path, mut manifest) = match &scope {
         InstallScope::Project(project_root) => {
-            let config_path = project_root.join("skiller.config.json");
-            let manifest: ProjectConfig = read_json_or_default(&config_path)?;
-            (
-                config_path,
-                project_root.join(".skiller/installed.json"),
-                manifest,
-            )
+            let loaded =
+                crate::project_store::load_project_config(project_root, !read_only, false)?;
+            for message in loaded.migration {
+                println!("{}", crate::output::HumanOutput::stdout().info(&message));
+            }
+            let state_path = crate::installer::install_paths(&scope)?.state_path;
+            (loaded.path, state_path, loaded.manifest)
         }
         InstallScope::Global => (
             global_config_path()?,
@@ -185,12 +211,6 @@ pub fn configure(
     validate_schema(manifest.version, "skill config")?;
     let state: InstalledState = read_json_or_default(&state_path)?;
     validate_installed_state(state.version)?;
-    let stale_aliases: BTreeSet<_> = sync
-        .statuses
-        .iter()
-        .filter(|(_, status)| status.availability == CatalogAvailability::Stale)
-        .map(|(alias, _)| alias.clone())
-        .collect();
     let mut display_catalogs = catalogs.clone();
     for (alias, status) in &sync.statuses {
         if let Some(catalog) = &status.catalog
@@ -221,32 +241,15 @@ pub fn configure(
         InstallScope::Project(root) => Some(root.as_path()),
         InstallScope::Global => None,
     };
-    let mut rows = config_rows(
+    let rows = config_rows(
         &display_catalogs,
         &state,
         &manifest,
         scope.is_global(),
         project_root,
         &desired_by_key,
-        &stale_aliases,
+        &sync.statuses,
     )?;
-    for row in &mut rows {
-        if matches!(
-            row.sync,
-            Some(
-                ProjectionStatus::KeepLocal
-                    | ProjectionStatus::Conflict
-                    | ProjectionStatus::OrphanedLocal
-            )
-        ) {
-            row.authoring = global_config
-                .catalogs
-                .get(&row.catalog)
-                .and_then(authoring_root_path)
-                .map(|root| root.join("skills").join(&row.name).display().to_string());
-        }
-    }
-
     if read_only {
         let output = PrintedConfig {
             scope: if scope.is_global() {
@@ -286,7 +289,7 @@ pub fn configure(
         }
         save_manifest(&scope, &config_path, &manifest, &mut global_config)?;
         println!("saved {}", config_path.display());
-        return Ok(());
+        return install_configured(scope, &manifest, &catalogs, &sync.unavailable_aliases());
     }
 
     match crate::config_tui::run(&rows, &mut manifest, scope.is_global())? {
@@ -294,9 +297,33 @@ pub fn configure(
         crate::config_tui::ConfigTuiResult::Save => {
             save_manifest(&scope, &config_path, &manifest, &mut global_config)?;
             println!("saved {}", config_path.display());
-            maybe_install(scope, &manifest, &catalogs, &sync.unavailable_aliases())
+            install_configured(scope, &manifest, &catalogs, &sync.unavailable_aliases())
         }
     }
+}
+
+fn config_is_read_only(machine: bool, assignments: &[String], agents: &[String]) -> bool {
+    machine && assignments.is_empty() && agents.is_empty()
+}
+
+fn refresh_warnings(statuses: &BTreeMap<String, CatalogStatus>) -> Vec<String> {
+    statuses
+        .values()
+        .filter_map(|status| {
+            let warning = status.warning.as_deref()?;
+            Some(match status.availability {
+                CatalogAvailability::Stale => format!(
+                    "catalog {} unavailable ({warning}). Showing the last synchronized copy as read-only. Check network or repository access, then rerun `skiller config`.",
+                    status.alias
+                ),
+                CatalogAvailability::Unavailable => format!(
+                    "catalog {} unavailable ({warning}). No synchronized copy is available. Check network or repository access, then rerun `skiller config`.",
+                    status.alias
+                ),
+                CatalogAvailability::Available => return None,
+            })
+        })
+        .collect()
 }
 
 fn save_manifest(
@@ -410,6 +437,30 @@ fn recommendation_reasons(
 }
 
 // ^ README.md#catalog-recommendations owns evidence bounds and match semantics.
+fn install_bundle(
+    catalog: &CatalogIndex,
+    skill: &crate::catalog::CatalogSkill,
+    global_scope: bool,
+) -> Vec<String> {
+    let mut pending = skill.requires.clone();
+    let mut visited = BTreeSet::new();
+    let mut installed_names = BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let Some(dependency) = catalog.skills.get(&name) else {
+            continue;
+        };
+        if dependency.global != global_scope {
+            continue;
+        }
+        installed_names.insert(dependency.installed_name.clone());
+        pending.extend(dependency.requires.iter().cloned());
+    }
+    installed_names.into_iter().collect()
+}
+
 fn config_rows(
     catalogs: &BTreeMap<String, CatalogIndex>,
     state: &InstalledState,
@@ -417,7 +468,7 @@ fn config_rows(
     global_scope: bool,
     project_root: Option<&Path>,
     desired: &BTreeMap<&str, &ResolvedSkill<'_>>,
-    stale_aliases: &BTreeSet<String>,
+    catalog_statuses: &BTreeMap<String, CatalogStatus>,
 ) -> Result<Vec<ConfigRow>> {
     let evidence = project_root.map(project_evidence).unwrap_or_default();
     let mut rows: Vec<_> = catalogs
@@ -448,6 +499,9 @@ fn config_rows(
                         .skills
                         .get(&key)
                         .filter(|installed| installed_name_is_current(installed, &installed_name));
+                    let stale = catalog_statuses.get(&catalog.alias).filter(|status| {
+                        status.availability == CatalogAvailability::Stale
+                    });
                     ConfigRow {
                         key: key.clone(),
                         catalog: catalog.alias.clone(),
@@ -458,14 +512,20 @@ fn config_rows(
                         installed_mode: installed.map(|skill| skill.mode),
                         installed_name,
                         description: skill.description.clone(),
+                        requires: skill.requires.clone(),
+                        installs_with: install_bundle(catalog, skill, global_scope),
                         selected: selection.map(SkillSelection::mode),
                         gitignore: selection.is_some_and(SkillSelection::gitignore),
                         required_by,
                         recommended_by: recommendation_reasons(skill.recommend.as_ref(), &evidence),
-                        read_only: stale_aliases.contains(&catalog.alias),
-                        status: stale_aliases
-                            .contains(&catalog.alias)
-                            .then_some("stale".to_owned()),
+                        read_only: stale.is_some(),
+                        status: stale.map(|_| "stale".to_owned()),
+                        read_only_reason: stale.map(|status| {
+                            let detail = status.warning.as_deref().unwrap_or("source unavailable");
+                            format!(
+                                "Catalog refresh failed: {detail}. Restore source access and reopen config."
+                            )
+                        }),
                         sync: None,
                         authoring: None,
                     }
@@ -482,9 +542,7 @@ fn config_rows(
                 .join(&installed.installed_name);
             if !matches!(
                 projection_status(false, installed, None, &actual)?,
-                ProjectionStatus::KeepLocal
-                    | ProjectionStatus::Conflict
-                    | ProjectionStatus::Unknown
+                ProjectionStatus::Drift | ProjectionStatus::Incoming
             ) {
                 continue;
             }
@@ -499,7 +557,9 @@ fn config_rows(
                 scope_order: i32::MAX,
                 name: name.to_owned(),
                 installed_name: installed.installed_name.clone(),
-                description: "Project override whose catalog entry is unavailable.".to_owned(),
+                description: "Managed projection whose catalog entry is unavailable.".to_owned(),
+                requires: Vec::new(),
+                installs_with: Vec::new(),
                 selected: selection.map(SkillSelection::mode),
                 gitignore: selection.is_some_and(SkillSelection::gitignore),
                 installed: true,
@@ -507,8 +567,9 @@ fn config_rows(
                 required_by: Vec::new(),
                 recommended_by: Vec::new(),
                 read_only: true,
-                status: Some("orphaned".to_owned()),
-                sync: Some(ProjectionStatus::OrphanedLocal),
+                status: Some("obsolete".to_owned()),
+                read_only_reason: None,
+                sync: Some(ProjectionStatus::Drift),
                 authoring: None,
             });
         }
@@ -596,15 +657,6 @@ fn printed_catalog_statuses(
 
 pub(crate) fn row_editable(row: &ConfigRow) -> bool {
     !row.read_only
-        && !matches!(
-            row.sync,
-            Some(
-                ProjectionStatus::KeepLocal
-                    | ProjectionStatus::Conflict
-                    | ProjectionStatus::OrphanedLocal
-                    | ProjectionStatus::Unknown
-            )
-        )
 }
 
 fn apply_assignments(
@@ -624,6 +676,13 @@ fn apply_assignments(
             format!("invalid selection {assignment:?}; expected catalog/name=STATE")
         })?;
         if !(available.contains(key) || state == "off" && manifest.skills.contains_key(key)) {
+            if let Some(reason) = rows
+                .iter()
+                .find(|row| row.key == key)
+                .and_then(|row| row.read_only_reason.as_deref())
+            {
+                anyhow::bail!("skill cannot be changed: {key}. {reason}");
+            }
             anyhow::bail!("skill is unavailable in this configuration: {key}");
         }
         if !seen.insert(key) {
@@ -681,37 +740,18 @@ pub(crate) fn toggle_gitignore(manifest: &mut ProjectConfig, key: &str) {
         .insert(key.to_owned(), SkillSelection::from_parts(mode, ignored));
 }
 
-fn maybe_install(
+fn install_configured(
     scope: InstallScope,
     manifest: &ProjectConfig,
     catalogs: &BTreeMap<String, CatalogIndex>,
     unavailable_aliases: &BTreeSet<String>,
 ) -> Result<()> {
-    let command = if scope.is_global() {
-        "skiller install -g"
-    } else {
-        "skiller install"
-    };
-    let answer = prompt(&format!("Run `{command}` now? [y/N]: "))?;
-    if answer == "y" || answer == "yes" {
-        crate::installer::install_with_catalogs_preserving(
-            scope,
-            manifest,
-            catalogs,
-            unavailable_aliases,
-        )?;
-    }
-    Ok(())
-}
-
-fn prompt(message: &str) -> Result<String> {
-    print!("{message}");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .context("reading interactive input")?;
-    Ok(input.trim().to_ascii_lowercase())
+    crate::installer::install_with_catalogs_preserving(
+        scope,
+        manifest,
+        catalogs,
+        unavailable_aliases,
+    )
 }
 
 #[cfg(test)]
@@ -720,6 +760,49 @@ mod tests {
     use crate::catalog::{CatalogRecommendation, CatalogSkill};
     use crate::model::{CatalogMetadata, InstalledSkill, SCHEMA_VERSION};
     use std::path::PathBuf;
+
+    #[test]
+    fn config_refreshes_only_for_interactive_or_mutating_calls() {
+        assert!(config_is_read_only(true, &[], &[]));
+        assert!(!config_is_read_only(false, &[], &[]));
+        assert!(!config_is_read_only(
+            true,
+            &["pyg/develop=enable".to_owned()],
+            &[]
+        ));
+        assert!(!config_is_read_only(true, &[], &["universal".to_owned()]));
+    }
+
+    #[test]
+    fn refresh_failure_explains_stale_and_unavailable_catalogs() {
+        let statuses = BTreeMap::from([
+            (
+                "empty".to_owned(),
+                CatalogStatus {
+                    alias: "empty".to_owned(),
+                    availability: CatalogAvailability::Unavailable,
+                    warning: Some("source unavailable".to_owned()),
+                    catalog: None,
+                },
+            ),
+            (
+                "kakao".to_owned(),
+                CatalogStatus {
+                    alias: "kakao".to_owned(),
+                    availability: CatalogAvailability::Stale,
+                    warning: Some("network unavailable".to_owned()),
+                    catalog: None,
+                },
+            ),
+        ]);
+        assert_eq!(
+            refresh_warnings(&statuses),
+            vec![
+                "catalog empty unavailable (source unavailable). No synchronized copy is available. Check network or repository access, then rerun `skiller config`.",
+                "catalog kakao unavailable (network unavailable). Showing the last synchronized copy as read-only. Check network or repository access, then rerun `skiller config`.",
+            ]
+        );
+    }
 
     #[test]
     fn selection_cycles_without_persisting_off() {
@@ -746,6 +829,8 @@ mod tests {
             name: "develop".to_owned(),
             installed_name: "develop".to_owned(),
             description: "Develop".to_owned(),
+            requires: Vec::new(),
+            installs_with: Vec::new(),
             selected: None,
             gitignore: false,
             installed: false,
@@ -754,6 +839,7 @@ mod tests {
             recommended_by: Vec::new(),
             read_only: false,
             status: None,
+            read_only_reason: None,
             sync: None,
             authoring: None,
         }];
@@ -897,6 +983,65 @@ mod tests {
     }
 
     #[test]
+    fn install_bundle_is_transitive_and_matches_scope() {
+        let skill = |name: &str, global: bool, requires: Vec<&str>| CatalogSkill {
+            name: name.to_owned(),
+            description: name.to_owned(),
+            digest: name.to_owned(),
+            scope: Some("test".to_owned()),
+            installed_name: name.to_owned(),
+            global,
+            recommend: None,
+            requires: requires.into_iter().map(str::to_owned).collect(),
+        };
+        let catalog = CatalogIndex {
+            alias: "pyg".to_owned(),
+            source: "test".to_owned(),
+            root: PathBuf::from("."),
+            metadata: CatalogMetadata::default(),
+            skills: BTreeMap::from([
+                (
+                    "root".to_owned(),
+                    skill("root", false, vec!["helper", "global-helper"]),
+                ),
+                ("helper".to_owned(), skill("helper", false, vec!["leaf"])),
+                ("leaf".to_owned(), skill("leaf", false, vec![])),
+                (
+                    "global-helper".to_owned(),
+                    skill("global-helper", true, vec![]),
+                ),
+            ]),
+        };
+        assert_eq!(
+            install_bundle(&catalog, &catalog.skills["root"], false),
+            vec!["helper", "leaf"]
+        );
+
+        let rows = config_rows(
+            &BTreeMap::from([("pyg".to_owned(), catalog)]),
+            &InstalledState::default(),
+            &ProjectConfig::default(),
+            false,
+            None,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let root = rows.iter().find(|row| row.name == "root").unwrap();
+        assert_eq!(root.requires, vec!["helper", "global-helper"]);
+        assert_eq!(root.installs_with, vec!["helper", "leaf"]);
+        let printed = serde_json::to_value(printed_skill(root)).unwrap();
+        assert_eq!(
+            printed["requires"],
+            serde_json::json!(["helper", "global-helper"])
+        );
+        assert_eq!(
+            printed["installsWith"],
+            serde_json::json!(["helper", "leaf"])
+        );
+    }
+
+    #[test]
     fn project_recommendations_require_each_populated_signal_class() {
         let root = std::env::current_dir()
             .unwrap()
@@ -938,7 +1083,7 @@ mod tests {
             false,
             Some(&root),
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1000,6 +1145,15 @@ mod tests {
         let catalogs = BTreeMap::from([("pyg".to_owned(), catalog)]);
         let manifest = ProjectConfig::default();
         let state = InstalledState::default();
+        let statuses = BTreeMap::from([(
+            "pyg".to_owned(),
+            CatalogStatus {
+                alias: "pyg".to_owned(),
+                availability: CatalogAvailability::Stale,
+                warning: Some("network unavailable".to_owned()),
+                catalog: None,
+            },
+        )]);
         let global = config_rows(
             &catalogs,
             &state,
@@ -1007,7 +1161,7 @@ mod tests {
             true,
             None,
             &BTreeMap::new(),
-            &BTreeSet::from(["pyg".to_owned()]),
+            &statuses,
         )
         .unwrap();
         let project = config_rows(
@@ -1017,14 +1171,53 @@ mod tests {
             false,
             None,
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            &BTreeMap::new(),
         )
         .unwrap();
         assert_eq!(global[0].name, "global");
         assert_eq!(global[0].installed_name, "global-scope");
         assert!(global[0].read_only);
         assert_eq!(global[0].status.as_deref(), Some("stale"));
+        assert_eq!(
+            global[0].read_only_reason.as_deref(),
+            Some(
+                "Catalog refresh failed: network unavailable. Restore source access and reopen config."
+            )
+        );
+        let mut stale_manifest = ProjectConfig::default();
+        let error = apply_assignments(
+            &mut stale_manifest,
+            &global,
+            &["pyg/global=enable".to_owned()],
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("skill cannot be changed: pyg/global"));
+        assert!(error.contains("Catalog refresh failed: network unavailable"));
+        stale_manifest.skills.insert(
+            "pyg/global".to_owned(),
+            SkillSelection::Mode(SelectionMode::Enable),
+        );
+        apply_assignments(
+            &mut stale_manifest,
+            &global,
+            &["pyg/global=off".to_owned()],
+            true,
+        )
+        .unwrap();
+        assert!(!stale_manifest.skills.contains_key("pyg/global"));
+
         assert_eq!(project[0].name, "project");
         assert_eq!(project[0].installed_name, "project-scope");
+        let mut fresh_manifest = ProjectConfig::default();
+        apply_assignments(
+            &mut fresh_manifest,
+            &project,
+            &["pyg/project=enable".to_owned()],
+            false,
+        )
+        .unwrap();
+        assert!(fresh_manifest.skills.contains_key("pyg/project"));
     }
 }
