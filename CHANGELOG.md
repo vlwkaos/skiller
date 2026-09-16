@@ -1,3 +1,10 @@
+## [0.14.1] - 2026-09-16
+
+### Changed
+
+- Print the install plan as aligned columns with a colored state column, and drop the catalog alias that repeated on every row.
+- Collapse the conflict list to plain skill names instead of restating the same sentence per row.
+
 ## [0.14.0] - 2026-09-16
 
 ### Features

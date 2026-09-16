@@ -75,6 +75,14 @@ pub(crate) struct HumanOutput {
     styled: bool,
 }
 
+/// Semantic roles for inline colored text, so callers never pick raw colors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tone {
+    Success,
+    Warning,
+    Muted,
+}
+
 impl HumanOutput {
     pub(crate) fn stdout() -> Self {
         Self {
@@ -120,6 +128,15 @@ impl HumanOutput {
 
     pub(crate) fn item(self, message: &str) -> String {
         self.line("•", message, ACCENT, Some("-"))
+    }
+
+    pub(crate) fn tone(self, message: &str, tone: Tone) -> String {
+        let color = match tone {
+            Tone::Success => SUCCESS,
+            Tone::Warning => WARNING,
+            Tone::Muted => MUTED,
+        };
+        self.paint(message, color, false)
     }
 
     fn line(self, icon: &str, message: &str, color: Color, plain_prefix: Option<&str>) -> String {
@@ -176,5 +193,8 @@ mod tests {
         assert!(output.error("blocked").contains("blocked"));
         assert!(output.heading("Updates").contains("Updates"));
         assert!(output.success("done").contains("\u{1b}["));
+        assert!(output.tone("ready", Tone::Success).contains("\u{1b}["));
+        assert!(output.tone("ready", Tone::Success).contains("ready"));
+        assert_eq!(HumanOutput::plain().tone("ready", Tone::Success), "ready");
     }
 }

@@ -55,7 +55,9 @@ Canonical `source` and optional `ref` own consumer content. `authoring_root` is 
 
 Interactive configuration restores the pre-Skiller selector geometry. Wide terminals keep scope navigation, compact one-line skill/configuration rows, and selected description, package-manager-style install plan, reverse dependents, installed state, and sync details visible in three columns. Enter moves focus from scopes to skills; Escape moves back. A persistent action bar exposes Save (`S`) and direct Cancel (`Q`). Narrow terminals retain the same scope-first navigation, stack only the selected skill's labeled details, and preserve both global actions before contextual hints. Semantic scope, dependency, mode, recommendation, warning, error, focus, and action colors remain stable and respect `NO_COLOR` and `TERM=dumb`. Redraws queue one synchronized frame and replace rows in place instead of blanking the alternate screen.
 
-Enabled skills allow agent and human invocation. Manual skills are human-only unless required. Unselected dependencies are agent-only. Dependency reachability never changes configured selection. Every install prints all configured roots as a dependency forest. Each edge names the immediate root or dependency that requires the child, and directly configured dependencies retain their configured mode annotation.
+Enabled skills allow agent and human invocation. Manual skills are human-only unless required. Unselected dependencies are agent-only. Dependency reachability never changes configured selection.
+
+Every install prints an aligned plan before any projection mutation: one row per resolved skill, tree branches for dependency edges, and a colored state column showing `Agent + Human`, `Human only`, or `dependency`. Skill names are shown without their catalog prefix. A dependency that is also configured directly is annotated in the state column rather than repeated as a separate identity.
 
 ## Project reconciliation
 

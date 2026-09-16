@@ -229,12 +229,20 @@ pub(crate) fn install_with_catalogs_recovery(
     validate_owned_state(&previous, paths.state_prefix)?;
     let active_manifest = manifest_without_unavailable(manifest, unavailable_aliases);
     let resolved = resolve_manifest(&active_manifest, catalogs, scope.is_global())?;
-    println!("{}", output.info("Install plan"));
-    let plan = install_forest_lines(&active_manifest, catalogs, &resolved)?;
+    let plan = install_plan_rows(&active_manifest, catalogs, &resolved)?;
     if plan.is_empty() {
+        println!("{}", output.info("Install plan"));
         println!("  (no configured skills)");
     } else {
-        for line in plan {
+        println!(
+            "{}",
+            output.info(&format!(
+                "Install plan  {} skill{}",
+                resolved.len(),
+                if resolved.len() == 1 { "" } else { "s" }
+            ))
+        );
+        for line in render_install_plan(&plan, output) {
             println!("  {line}");
         }
     }
@@ -782,46 +790,84 @@ fn split_key(key: &str) -> Result<(&str, &str)> {
         .with_context(|| format!("invalid catalog skill identifier: {key}"))
 }
 
-fn install_forest_lines(
+/// One pre-install plan row. `branch` holds only the tree glyphs before the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstallPlanRow {
+    branch: String,
+    name: String,
+    state: InstallPlanState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallPlanState {
+    Configured(SelectionMode),
+    Dependency,
+    ConfiguredDependency(SelectionMode),
+}
+
+impl InstallPlanState {
+    fn label(self) -> String {
+        match self {
+            Self::Configured(mode) => selection_mode_label(mode).to_owned(),
+            Self::Dependency => "dependency".to_owned(),
+            Self::ConfiguredDependency(mode) => {
+                format!("dependency, also configured {}", selection_mode_label(mode))
+            }
+        }
+    }
+
+    fn tone(self) -> crate::output::Tone {
+        match self {
+            Self::Configured(SelectionMode::Enable)
+            | Self::ConfiguredDependency(SelectionMode::Enable) => crate::output::Tone::Success,
+            Self::Configured(SelectionMode::Manual)
+            | Self::ConfiguredDependency(SelectionMode::Manual) => crate::output::Tone::Warning,
+            Self::Dependency => crate::output::Tone::Muted,
+        }
+    }
+}
+
+// ^ README.md#configuration documents the install plan shown before projection mutation.
+fn install_plan_rows(
     manifest: &ProjectConfig,
     catalogs: &BTreeMap<String, CatalogIndex>,
     resolved: &[ResolvedSkill<'_>],
-) -> Result<Vec<String>> {
+) -> Result<Vec<InstallPlanRow>> {
     let resolved_by_key: BTreeMap<_, _> = resolved
         .iter()
         .map(|skill| (skill.key.as_str(), skill))
         .collect();
-    let mut lines = Vec::new();
+    let mut rows = Vec::new();
     for (key, selection) in &manifest.skills {
         let Some(root) = resolved_by_key.get(key.as_str()) else {
             continue;
         };
-        lines.push(format!(
-            "{}  configured {}",
-            root.key,
-            selection_mode_label(selection.mode())
-        ));
-        append_dependency_lines(
+        rows.push(InstallPlanRow {
+            branch: String::new(),
+            name: root.installed_name.clone(),
+            state: InstallPlanState::Configured(selection.mode()),
+        });
+        append_dependency_rows(
             &root.key,
             root,
-            "  ",
+            "",
             manifest,
             catalogs,
             &resolved_by_key,
-            &mut lines,
+            &mut rows,
         )?;
     }
-    Ok(lines)
+    Ok(rows)
 }
 
-fn append_dependency_lines(
+fn append_dependency_rows(
     parent_key: &str,
     parent: &ResolvedSkill<'_>,
     prefix: &str,
     manifest: &ProjectConfig,
     catalogs: &BTreeMap<String, CatalogIndex>,
     resolved: &BTreeMap<&str, &ResolvedSkill<'_>>,
-    lines: &mut Vec<String>,
+    rows: &mut Vec<InstallPlanRow>,
 ) -> Result<()> {
     let (alias, _) = split_key(parent_key)?;
     let catalog = catalogs
@@ -835,29 +881,48 @@ fn append_dependency_lines(
         .collect();
     for (index, dependency_key) in dependencies.iter().enumerate() {
         let last = index + 1 == dependencies.len();
-        let branch = if last { "└─" } else { "├─" };
-        let configured = manifest.skills.get(dependency_key).map(|selection| {
-            format!(
-                ", also configured {}",
-                selection_mode_label(selection.mode())
-            )
-        });
-        lines.push(format!(
-            "{prefix}{branch} {dependency_key}  required by {parent_key}{}",
-            configured.as_deref().unwrap_or_default()
-        ));
         let child = resolved[dependency_key.as_str()];
-        append_dependency_lines(
+        rows.push(InstallPlanRow {
+            branch: format!("{prefix}{}", if last { "└─ " } else { "├─ " }),
+            name: child.installed_name.clone(),
+            state: match manifest.skills.get(dependency_key) {
+                Some(selection) => InstallPlanState::ConfiguredDependency(selection.mode()),
+                None => InstallPlanState::Dependency,
+            },
+        });
+        append_dependency_rows(
             dependency_key,
             child,
-            &format!("{prefix}{} ", if last { "  " } else { "│ " }),
+            &format!("{prefix}{}", if last { "   " } else { "│  " }),
             manifest,
             catalogs,
             resolved,
-            lines,
+            rows,
         )?;
     }
     Ok(())
+}
+
+/// Aligns the name column and colors only the state column, so names stay scannable.
+fn render_install_plan(rows: &[InstallPlanRow], output: crate::output::HumanOutput) -> Vec<String> {
+    use unicode_width::UnicodeWidthStr;
+    let labels: Vec<_> = rows
+        .iter()
+        .map(|row| format!("{}{}", row.branch, row.name))
+        .collect();
+    let width = labels.iter().map(|label| label.width()).max().unwrap_or(0);
+    labels
+        .into_iter()
+        .zip(rows)
+        .map(|(label, row)| {
+            let padding = width.saturating_sub(label.width());
+            format!(
+                "{label}{}  {}",
+                " ".repeat(padding),
+                output.tone(&row.state.label(), row.state.tone())
+            )
+        })
+        .collect()
 }
 
 fn selection_mode_label(mode: SelectionMode) -> &'static str {
@@ -1273,11 +1338,8 @@ fn resolve_unowned_overrides(selection: &mut ReconcileSelection) -> Result<()> {
     );
     for conflict in &selection.conflicts {
         println!(
-            "{}",
-            output.item(&format!(
-                "{} ({}) already exists and is not managed by Skiller",
-                conflict.installed_name, conflict.key
-            ))
+            "  {}",
+            output.tone(&conflict.installed_name, crate::output::Tone::Muted)
         );
     }
     println!(
@@ -1775,13 +1837,62 @@ mod tests {
             agents: crate::model::default_agents(),
         };
         let resolved = resolve_manifest(&manifest, &catalogs, true).unwrap();
+        let rows = install_plan_rows(&manifest, &catalogs, &resolved).unwrap();
         assert_eq!(
-            install_forest_lines(&manifest, &catalogs, &resolved).unwrap(),
+            rows,
             vec![
-                "pyg/dependency  configured Human only",
-                "pyg/root  configured Agent + Human",
-                "  └─ pyg/dependency  required by pyg/root, also configured Human only",
+                InstallPlanRow {
+                    branch: String::new(),
+                    name: "dependency".to_owned(),
+                    state: InstallPlanState::Configured(SelectionMode::Manual),
+                },
+                InstallPlanRow {
+                    branch: String::new(),
+                    name: "root".to_owned(),
+                    state: InstallPlanState::Configured(SelectionMode::Enable),
+                },
+                InstallPlanRow {
+                    branch: "└─ ".to_owned(),
+                    name: "dependency".to_owned(),
+                    state: InstallPlanState::ConfiguredDependency(SelectionMode::Manual),
+                },
             ]
+        );
+
+        // Names drop the repeated catalog prefix and states align in one column.
+        let rendered = render_install_plan(&rows, crate::output::HumanOutput::plain());
+        assert_eq!(
+            rendered,
+            vec![
+                "dependency     Human only",
+                "root           Agent + Human",
+                "└─ dependency  dependency, also configured Human only",
+            ]
+        );
+        assert!(rendered.iter().all(|line| !line.contains("pyg/")));
+        assert!(
+            render_install_plan(&rows, crate::output::HumanOutput::styled())
+                .iter()
+                .all(|line| line.contains('\u{1b}'))
+        );
+    }
+
+    #[test]
+    fn install_plan_aligns_nested_dependency_branches() {
+        let catalogs = BTreeMap::from([("pyg".to_owned(), catalog(false))]);
+        let manifest = ProjectConfig {
+            version: SCHEMA_VERSION,
+            skills: BTreeMap::from([(
+                "pyg/root".to_owned(),
+                SkillSelection::Mode(SelectionMode::Enable),
+            )]),
+            agents: crate::model::default_agents(),
+        };
+        let resolved = resolve_manifest(&manifest, &catalogs, false).unwrap();
+        let rows = install_plan_rows(&manifest, &catalogs, &resolved).unwrap();
+        assert_eq!(
+            render_install_plan(&rows, crate::output::HumanOutput::plain()),
+            vec!["root           Agent + Human", "└─ dependency  dependency"]
         );
     }
 
