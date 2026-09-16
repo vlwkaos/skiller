@@ -1,4 +1,14 @@
-## [Unreleased]
+## [0.14.0] - 2026-09-16
+
+### Features
+
+- Ask interactively before replacing divergent unowned skills during installation, accepting `y` for one, `Y` for all, or any other answer to keep; automated and piped runs never replace.
+- Render dependency bundles as bounded, color-aware install-plan trees with a package count and overflow summary.
+
+### Changed
+
+- Keep explicit Save and Cancel actions visible in configuration, with `Q` providing direct cancellation and Escape retaining contextual back navigation.
+- Explain an unowned-name conflict as a skipped installation with the existing copy left unchanged, instead of the ambiguous "To keep it" wording.
 
 ## [0.13.0] - 2026-09-15
 

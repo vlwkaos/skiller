@@ -53,7 +53,7 @@ Project mode requires Git. Outside a repository, bare `skiller` opens Global con
 
 Canonical `source` and optional `ref` own consumer content. `authoring_root` is an optional writable checkout used for guidance and unpublished-draft checks. Installation always uses canonical content.
 
-Interactive configuration restores the pre-Skiller selector geometry. Wide terminals keep scope navigation, compact one-line skill/configuration rows, and selected description, direct requirements, install bundle, required-by, installed, and sync details visible in three columns. Enter moves focus from scopes to skills; Escape moves back. Narrow terminals retain the same scope-first navigation and stack only the selected skill's labeled details. Semantic scope, mode, recommendation, warning, error, focus, and hint colors remain stable and respect `NO_COLOR` and `TERM=dumb`. Redraws queue one synchronized frame and replace rows in place instead of blanking the alternate screen.
+Interactive configuration restores the pre-Skiller selector geometry. Wide terminals keep scope navigation, compact one-line skill/configuration rows, and selected description, package-manager-style install plan, reverse dependents, installed state, and sync details visible in three columns. Enter moves focus from scopes to skills; Escape moves back. A persistent action bar exposes Save (`S`) and direct Cancel (`Q`). Narrow terminals retain the same scope-first navigation, stack only the selected skill's labeled details, and preserve both global actions before contextual hints. Semantic scope, dependency, mode, recommendation, warning, error, focus, and action colors remain stable and respect `NO_COLOR` and `TERM=dumb`. Redraws queue one synchronized frame and replace rows in place instead of blanking the alternate screen.
 
 Enabled skills allow agent and human invocation. Manual skills are human-only unless required. Unselected dependencies are agent-only. Dependency reachability never changes configured selection. Every install prints all configured roots as a dependency forest. Each edge names the immediate root or dependency that requires the child, and directly configured dependencies retain their configured mode annotation.
 
@@ -68,7 +68,9 @@ Catalog-managed installations are read-only, disposable projections. The catalog
 | `drift` | Projection differs from authoritative content or lacks an old baseline | Overwrite it |
 | `incoming` | Catalog identity, mode, or metadata changed | Install the new projection |
 
-To change a managed skill, edit its catalog authoring source, publish it, then run `skiller config` or `skiller install`. Skiller does not preserve project overrides or merge projection edits. A divergent unowned same-name skill remains protected and blocks noninteractive installation; byte-identical unowned projections are adopted safely.
+To change a managed skill, edit its catalog authoring source, publish it, then run `skiller config` or `skiller install`. Skiller does not preserve project overrides or merge projection edits. A divergent unowned same-name skill remains protected; byte-identical unowned projections are adopted safely.
+
+A divergent unowned name blocks noninteractive installation and is reported as `[unowned-conflict]`. When installation runs in a terminal, Skiller lists each conflict and asks per skill: `y` replaces that name with the catalog version, `Y` replaces every remaining conflict, and any other answer keeps the existing copy. An unanswered prompt, EOF, and every automated or piped run keep the existing copy, so replacement only happens through explicit interactive approval.
 
 On the first mutating Project command, Skiller imports legacy `<project>/skiller.config.json` and `<project>/.skiller/` data. It removes untracked legacy files after successful migration. A tracked or divergent legacy config remains for explicit review but is ignored once the Git-private config exists.
 

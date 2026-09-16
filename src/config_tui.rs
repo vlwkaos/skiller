@@ -269,10 +269,11 @@ fn handle_key(
             }
         }
         KeyCode::Char('s') => return InputResult::Save,
-        KeyCode::Esc | KeyCode::Char('q') if state.screen == ConfigScreen::Skills => {
+        KeyCode::Char('q') => return InputResult::Cancel,
+        KeyCode::Esc if state.screen == ConfigScreen::Skills => {
             state.screen = ConfigScreen::Scopes;
         }
-        KeyCode::Esc | KeyCode::Char('q') => return InputResult::Cancel,
+        KeyCode::Esc => return InputResult::Cancel,
         _ => {}
     }
     if state.screen == ConfigScreen::Scopes && state.scope != previous_scope {
@@ -332,7 +333,7 @@ fn write_frame(
                 )?;
                 continue;
             }
-            if (index == 1 && line.contains(" scopes · ")) || index + 1 == lines.len() {
+            if index == 1 && line.contains(" scopes · ") {
                 print_colored(
                     output,
                     line,
@@ -413,6 +414,9 @@ fn print_colored(
 }
 
 fn segment_color(segment: &str, state: ConfigTuiState) -> Option<Color> {
+    if segment.starts_with("Actions") || segment.starts_with("S Save") {
+        return Some(crate::output::ACCENT);
+    }
     if segment.starts_with("Scopes") {
         return Some(if state.screen == ConfigScreen::Scopes {
             crate::output::ACCENT
@@ -427,11 +431,17 @@ fn segment_color(segment: &str, state: ConfigTuiState) -> Option<Color> {
             crate::output::MUTED
         });
     }
-    if matches!(
-        segment,
-        "Details" | "Description" | "Requires" | "Installs with" | "Installed"
-    ) {
+    if matches!(segment, "Details" | "Description" | "Installed")
+        || segment.starts_with("Install plan")
+    {
         return Some(crate::output::ACCENT);
+    }
+    if segment.contains("more") && (segment.starts_with("├─") || segment.starts_with("└─"))
+    {
+        return Some(crate::output::MUTED);
+    }
+    if segment.starts_with("├─") || segment.starts_with("└─") {
+        return Some(crate::output::SUCCESS);
     }
     if segment == "Recommended" || segment.contains('★') {
         return Some(crate::output::WARNING);
@@ -465,17 +475,13 @@ fn segment_color(segment: &str, state: ConfigTuiState) -> Option<Color> {
 }
 
 fn is_heading(segment: &str) -> bool {
-    segment.starts_with("Scopes")
+    segment.starts_with("Actions")
+        || segment.starts_with("Scopes")
         || segment.starts_with("Skills")
+        || segment.starts_with("Install plan")
         || matches!(
             segment,
-            "Details"
-                | "Description"
-                | "Recommended"
-                | "Requires"
-                | "Installs with"
-                | "Required by"
-                | "Installed"
+            "Details" | "Description" | "Recommended" | "Required by" | "Installed"
         )
 }
 
@@ -922,13 +928,8 @@ fn detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
         lines.extend(wrap(&row.recommended_by.join(", "), width, 2));
     }
     lines.push(String::new());
-    lines.push("Requires".to_owned());
-    lines.extend(wrap(&dependency_state(&row.requires), width, 2));
-    if !row.installs_with.is_empty() {
-        lines.push(String::new());
-        lines.push("Installs with".to_owned());
-        lines.extend(wrap(&row.installs_with.join(", "), width, 2));
-    }
+    lines.push(install_plan_heading(&row.installs_with));
+    lines.extend(install_plan_rows(&row.installs_with, width, 4));
     lines.push(String::new());
     lines.push("Required by".to_owned());
     lines.extend(wrap(&required_by_state(row), width, 2));
@@ -947,16 +948,56 @@ fn stacked_detail_lines(row: &ConfigRow, width: usize) -> Vec<String> {
     if !row.recommended_by.is_empty() {
         details.push(("Recommended", row.recommended_by.join(", ")));
     }
-    details.push(("Requires", dependency_state(&row.requires)));
-    if !row.installs_with.is_empty() {
-        details.push(("Installs with", row.installs_with.join(", ")));
-    }
-    details.extend([
-        ("Required by", required_by_state(row)),
-        ("Installed", installed_state(row)),
-    ]);
     for (label, value) in details {
         lines.extend(wrap(&format!("{label}: {value}"), width, 2));
+    }
+    lines.push(install_plan_heading(&row.installs_with));
+    lines.extend(install_plan_rows(&row.installs_with, width, 3));
+    for (label, value) in [
+        ("Required by", required_by_state(row)),
+        ("Installed", installed_state(row)),
+    ] {
+        lines.extend(wrap(&format!("{label}: {value}"), width, 2));
+    }
+    lines
+}
+
+fn install_plan_heading(dependencies: &[String]) -> String {
+    if dependencies.is_empty() {
+        "Install plan  No additional packages".to_owned()
+    } else {
+        format!(
+            "Install plan  {} package{}",
+            dependencies.len(),
+            if dependencies.len() == 1 { "" } else { "s" }
+        )
+    }
+}
+
+fn install_plan_rows(dependencies: &[String], width: usize, maximum: usize) -> Vec<String> {
+    if dependencies.is_empty() || maximum == 0 {
+        return Vec::new();
+    }
+    let visible = if dependencies.len() > maximum {
+        maximum.saturating_sub(1)
+    } else {
+        dependencies.len()
+    };
+    let mut lines: Vec<_> = dependencies
+        .iter()
+        .take(visible)
+        .enumerate()
+        .map(|(index, dependency)| {
+            let last = index + 1 == visible && visible == dependencies.len();
+            fit(
+                &format!("  {} {dependency}", if last { "└─" } else { "├─" }),
+                width,
+            )
+        })
+        .collect();
+    let omitted = dependencies.len().saturating_sub(visible);
+    if omitted > 0 {
+        lines.push(fit(&format!("  └─ +{omitted} more"), width));
     }
     lines
 }
@@ -1031,34 +1072,31 @@ fn key_hint(
     state: ConfigTuiState,
     width: usize,
 ) -> String {
-    let navigation = "[↑/↓] Navigate";
-    let save = "[S] Save";
+    let navigation = "↑/↓ Navigate";
+    let save = "[ Save  S ]";
+    let cancel = "[ Cancel  Q ]";
     match state.screen {
         ConfigScreen::Scopes => {
-            let mut hints = Vec::new();
+            let mut hints = vec!["Actions", save, cancel];
             if !groups.is_empty() {
-                hints.extend([navigation, "[Enter] Open"]);
+                hints.extend([navigation, "Enter Open"]);
             }
-            hints.extend([save, "[Esc] Cancel"]);
-            fit_hint(&hints, &["[Enter] Open", save, "[Esc] Cancel"], width)
+            fit_hint(&hints, &["Actions", save, cancel], width)
         }
         ConfigScreen::Skills => {
             let row = selected_skill(groups, state);
-            let mut hints = vec![navigation];
-            let mut compact = Vec::new();
+            let mut hints = vec!["Actions", save, cancel, navigation];
+            let mut compact = vec!["Actions", save, cancel];
             if row.is_some_and(row_editable) {
-                hints.push("[Space] Mode");
-                compact.push("[Space] Mode");
+                hints.push("Space Mode");
+                compact.push("Space Mode");
                 if !global_scope && row.is_some_and(|row| manifest.skills.contains_key(&row.key)) {
-                    hints.push("[I] Git-ignore");
-                    compact.push("[I] Ignore");
+                    hints.push("I Git-ignore");
                 }
             } else if row.is_some_and(|row| row.read_only_reason.is_some()) {
-                hints.push("[Read-only: catalog stale]");
-                compact.push("[Read-only]");
+                hints.push("Read-only: catalog stale");
             }
-            hints.extend([save, "[Esc] Scopes"]);
-            compact.extend([save, "[Esc] Scopes"]);
+            hints.push("Esc Back");
             fit_hint(&hints, &compact, width)
         }
     }
@@ -1072,8 +1110,10 @@ fn fit_hint(full: &[&str], compact: &[&str], width: usize) -> String {
     let compact = compact.join("  ");
     if compact.width() <= width {
         compact
+    } else if width >= "S Save  Q Cancel".width() {
+        "S Save  Q Cancel".to_owned()
     } else {
-        fit(&compact, width)
+        fit("S/Q", width)
     }
 }
 
@@ -1238,7 +1278,9 @@ mod tests {
         assert!(rendered.contains("2 skills · 1 configured"));
         assert!(rendered.contains("$knowledge"));
         assert!(!rendered.contains("develop"));
-        assert!(rendered.contains("[Enter] Open"));
+        assert!(rendered.contains("Enter Open"));
+        assert!(rendered.contains("[ Save  S ]"));
+        assert!(rendered.contains("[ Cancel  Q ]"));
     }
 
     #[test]
@@ -1269,6 +1311,26 @@ mod tests {
     }
 
     #[test]
+    fn install_plan_bounds_large_dependency_sets() {
+        let dependencies: Vec<_> = ["a", "b", "c", "d", "e", "f"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            install_plan_heading(&dependencies),
+            "Install plan  6 packages"
+        );
+        assert_eq!(
+            install_plan_rows(&dependencies, 40, 4),
+            vec!["  ├─ a", "  ├─ b", "  ├─ c", "  └─ +3 more"]
+        );
+        assert_eq!(
+            install_plan_heading(&[]),
+            "Install plan  No additional packages"
+        );
+    }
+
+    #[test]
     fn semantic_colors_are_stable_by_scope_identity_and_state_role() {
         assert_eq!(
             scope_color("› ○ $engineering 0/2"),
@@ -1295,6 +1357,14 @@ mod tests {
         );
         assert_eq!(
             segment_color("develop  ○ Off", state(ConfigScreen::Skills, 0, 0)),
+            Some(crate::output::MUTED)
+        );
+        assert_eq!(
+            segment_color("├─ gh-pr", state(ConfigScreen::Skills, 0, 0)),
+            Some(crate::output::SUCCESS)
+        );
+        assert_eq!(
+            segment_color("└─ +3 more", state(ConfigScreen::Skills, 0, 0)),
             Some(crate::output::MUTED)
         );
     }
@@ -1331,6 +1401,18 @@ mod tests {
             handle_key(&rows, &mut manifest, true, &mut position, KeyCode::Esc),
             InputResult::Cancel
         );
+
+        position.screen = ConfigScreen::Skills;
+        assert_eq!(
+            handle_key(
+                &rows,
+                &mut manifest,
+                true,
+                &mut position,
+                KeyCode::Char('q')
+            ),
+            InputResult::Cancel
+        );
     }
 
     #[test]
@@ -1365,10 +1447,11 @@ mod tests {
         assert!(!rendered.contains("Config  "));
         assert!(rendered.contains("│ Details"));
         assert!(rendered.contains("Description"));
-        assert!(rendered.contains("Requires"));
-        assert!(rendered.contains("recall, simplify"));
-        assert!(rendered.contains("Installs with"));
-        assert!(rendered.contains("gh-pr, ko-reader-brief"));
+        assert!(!rendered.contains("Requires"));
+        assert!(!rendered.contains("Installs with"));
+        assert!(rendered.contains("Install plan  2 packages"));
+        assert!(rendered.contains("├─ gh-pr"));
+        assert!(rendered.contains("└─ ko-reader-brief"));
         assert!(rendered.contains("Required by"));
         assert!(rendered.contains("release, skiller"));
         assert!(rendered.contains("Agent + Human as develop"));
@@ -1450,8 +1533,9 @@ mod tests {
                 .any(|line| line.starts_with("› develop") && line.contains("○ Off"))
         );
         assert!(rendered.contains("Description: Configure develop"));
-        assert!(rendered.contains("Requires: recall"));
-        assert!(rendered.contains("Installs with: gh-pr, ko-reader-brief"));
+        assert!(rendered.contains("Install plan  2 packages"));
+        assert!(rendered.contains("├─ gh-pr"));
+        assert!(rendered.contains("└─ ko-reader-brief"));
         assert!(rendered.contains("Required by: None"));
         assert!(rendered.contains("Installed: Agent + Human as develop"));
         assert!(lines.iter().all(|line| line.width() <= 52));
@@ -1484,8 +1568,8 @@ mod tests {
         assert!(rendered.contains("Availability"));
         assert!(rendered.contains("Catalog refresh failed:"));
         assert!(rendered.contains("unavailable. Restore source access"));
-        assert!(rendered.contains("[Read-only: catalog stale]"));
-        assert!(!rendered.contains("[Space] Mode"));
+        assert!(rendered.contains("Read-only: catalog stale"));
+        assert!(!rendered.contains("Space Mode"));
     }
 
     #[test]
@@ -1502,9 +1586,10 @@ mod tests {
         );
         let rendered = lines.join("\n");
         assert!(rendered.contains("DRIFT"));
-        assert!(rendered.contains("[Space] Mode"));
-        assert!(rendered.contains("[S] Save"));
-        assert!(rendered.contains("[Esc] Scopes"));
+        assert!(rendered.contains("Space Mode"));
+        assert!(rendered.contains("[ Save  S ]"));
+        assert!(rendered.contains("[ Cancel  Q ]"));
+        assert!(rendered.contains("Esc Back"));
     }
 
     #[test]
@@ -1527,13 +1612,16 @@ mod tests {
         let mut manifest = ProjectConfig::default();
         assert!(!key_hint(&groups, &manifest, false, position, 100).contains("Git-ignore"));
         cycle_selection(&mut manifest, "pyg/develop");
-        assert!(key_hint(&groups, &manifest, false, position, 100).contains("[I] Git-ignore"));
+        let full = key_hint(&groups, &manifest, false, position, 100);
+        assert!(full.contains("I Git-ignore"));
+        assert!(full.contains("[ Save  S ]"));
+        assert!(full.contains("[ Cancel  Q ]"));
+        assert!(full.contains("Esc Back"));
         assert!(!key_hint(&groups, &manifest, true, position, 100).contains("Git-ignore"));
         let narrow = key_hint(&groups, &manifest, false, position, 52);
-        assert!(narrow.contains("[Space] Mode"));
-        assert!(narrow.contains("[I] Ignore"));
-        assert!(narrow.contains("[S] Save"));
-        assert!(narrow.contains("[Esc] Scopes"));
+        assert!(narrow.contains("[ Save  S ]"));
+        assert!(narrow.contains("[ Cancel  Q ]"));
+        assert!(narrow.contains("Space Mode"));
     }
 
     #[test]
@@ -1576,5 +1664,6 @@ mod tests {
         );
         assert_eq!(lines.len(), 4);
         assert!(lines.iter().all(|line| line.width() <= 8));
+        assert_eq!(lines.last().map(String::as_str), Some("S/Q"));
     }
 }

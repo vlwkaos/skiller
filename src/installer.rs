@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -100,6 +101,15 @@ struct ReconcileSelection {
     install_names: BTreeSet<String>,
     complete_names: BTreeSet<String>,
     blocked: Vec<String>,
+    conflicts: Vec<UnownedConflict>,
+}
+
+// ^ README.md#project-reconciliation defines the unowned-name boundary an interactive replace may cross.
+#[derive(Debug, Clone)]
+struct UnownedConflict {
+    key: String,
+    installed_name: String,
+    message: String,
 }
 
 pub fn install(scope: InstallScope) -> Result<()> {
@@ -319,7 +329,7 @@ pub(crate) fn install_with_catalogs_recovery(
     let mut changed = false;
     let result = (|| -> Result<Vec<String>> {
         prepare_skills(&resolved, &prepared_root)?;
-        let selection = classify_reconciliation(
+        let mut selection = classify_reconciliation(
             &paths.command_root,
             scope.is_global(),
             &previous,
@@ -328,6 +338,7 @@ pub(crate) fn install_with_catalogs_recovery(
             &manifest.agents,
             &prepared_root,
         )?;
+        resolve_unowned_overrides(&mut selection)?;
         let lock_owned_names: BTreeSet<_> = previous
             .skills
             .values()
@@ -1234,6 +1245,111 @@ pub(crate) fn projection_status(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplacementChoice {
+    This,
+    All,
+    Keep,
+}
+
+/// Unowned divergent names stay blocked unless an interactive operator approves replacement.
+/// Approved names reuse the same reinstall path as owned drift, so no extra deletion logic exists.
+fn resolve_unowned_overrides(selection: &mut ReconcileSelection) -> Result<()> {
+    if selection.conflicts.is_empty() || !install_is_interactive() {
+        return Ok(());
+    }
+    let output = crate::output::HumanOutput::stdout();
+    println!(
+        "{}",
+        output.heading(&format!(
+            "Conflicts: {} selected skill{} already exist and are not managed by Skiller",
+            selection.conflicts.len(),
+            if selection.conflicts.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ))
+    );
+    for conflict in &selection.conflicts {
+        println!(
+            "{}",
+            output.item(&format!(
+                "{} ({}) already exists and is not managed by Skiller",
+                conflict.installed_name, conflict.key
+            ))
+        );
+    }
+    println!(
+        "{}",
+        output
+            .warning("Replacing one deletes its current content; keeping one leaves it unchanged")
+    );
+    let mut replace_all = false;
+    let mut approved = BTreeSet::new();
+    for conflict in &selection.conflicts {
+        let replace = if replace_all {
+            true
+        } else {
+            match prompt_unowned_replacement(&conflict.installed_name)? {
+                ReplacementChoice::All => {
+                    replace_all = true;
+                    true
+                }
+                ReplacementChoice::This => true,
+                ReplacementChoice::Keep => false,
+            }
+        };
+        if replace {
+            approved.insert(conflict.message.clone());
+        }
+    }
+    if approved.is_empty() {
+        return Ok(());
+    }
+    for conflict in &selection.conflicts {
+        if approved.contains(&conflict.message) {
+            selection
+                .install_names
+                .insert(conflict.installed_name.clone());
+            selection
+                .blocked
+                .retain(|message| message != &conflict.message);
+        }
+    }
+    Ok(())
+}
+
+fn install_is_interactive() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+/// EOF and any unrecognized answer keep the existing content, so the safe choice is the default.
+fn prompt_unowned_replacement(installed_name: &str) -> Result<ReplacementChoice> {
+    print!(
+        "  Replace {installed_name} with the catalog version? [y] replace  [Y] replace all  [n] keep: "
+    );
+    io::stdout()
+        .flush()
+        .context("flushing replacement prompt")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("reading replacement choice")?;
+    Ok(match input.trim() {
+        "y" | "yes" => ReplacementChoice::This,
+        "Y" | "YES" | "a" | "all" => ReplacementChoice::All,
+        _ => ReplacementChoice::Keep,
+    })
+}
+
+fn unowned_conflict_message(key: &str, installed_name: &str, global_scope: bool) -> String {
+    format!(
+        "[unowned-conflict] {key} was not installed: a skill named {installed_name} already exists and is not managed by Skiller. The existing copy was left unchanged. Remove or rename it and rerun to let Skiller manage this name, or stop trying with `skiller config{} --set {key}=off`",
+        if global_scope { " -g" } else { "" }
+    )
+}
+
 fn exact_projection_matches(actual: &Path, intended: &Path) -> Result<bool> {
     let actual = match std::fs::canonicalize(actual) {
         Ok(path) => path,
@@ -1270,6 +1386,7 @@ fn classify_reconciliation(
         install_names: BTreeSet::new(),
         complete_names: BTreeSet::new(),
         blocked: Vec::new(),
+        conflicts: Vec::new(),
     };
     for skill in resolved {
         let intended = prepared_root.join("skills").join(&skill.installed_name);
@@ -1317,21 +1434,25 @@ fn classify_reconciliation(
                 selection.install_names.insert(skill.installed_name.clone());
             }
         } else {
-            selection.blocked.push(format!(
-                "[unowned-conflict] {} differs from existing unowned {}; kept existing content. To keep it, run `skiller config{} --set {}=off`",
-                skill.key,
-                skill.installed_name,
-                if global_scope { " -g" } else { "" },
-                skill.key
-            ));
+            let message = unowned_conflict_message(&skill.key, &skill.installed_name, global_scope);
+            selection.blocked.push(message.clone());
+            selection.conflicts.push(UnownedConflict {
+                key: skill.key.clone(),
+                installed_name: skill.installed_name.clone(),
+                message,
+            });
         }
     }
 
     let mut blocked_names: BTreeSet<_> = selection
-        .blocked
+        .conflicts
         .iter()
-        .filter_map(|message| resolved.iter().find(|skill| message.contains(&skill.key)))
-        .map(|skill| skill.source_name.clone())
+        .filter_map(|conflict| {
+            resolved
+                .iter()
+                .find(|skill| skill.key == conflict.key)
+                .map(|skill| skill.source_name.clone())
+        })
         .collect();
     loop {
         let mut changed = false;
@@ -1784,13 +1905,49 @@ mod tests {
         )
         .unwrap();
         assert!(blocked.complete_names.is_empty());
+        assert!(blocked.install_names.is_empty());
         assert_eq!(
             blocked.blocked,
-            vec![
-                "[unowned-conflict] pyg/root differs from existing unowned root; kept existing content. To keep it, run `skiller config --set pyg/root=off`"
-            ]
+            vec![unowned_conflict_message("pyg/root", "root", false)]
         );
+        assert_eq!(blocked.conflicts.len(), 1);
+        assert_eq!(blocked.conflicts[0].installed_name, "root");
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn unowned_conflict_message_states_the_consequence_and_both_options() {
+        let project = unowned_conflict_message("pyg/note", "note", false);
+        assert!(project.contains("pyg/note was not installed"));
+        assert!(project.contains("The existing copy was left unchanged"));
+        assert!(project.contains("skiller config --set pyg/note=off"));
+        assert!(!project.contains(" -g --set"));
+
+        let global = unowned_conflict_message("pyg/note", "note", true);
+        assert!(global.contains("skiller config -g --set pyg/note=off"));
+    }
+
+    #[test]
+    fn automated_installs_never_override_an_unowned_conflict() {
+        let mut selection = ReconcileSelection {
+            install_names: BTreeSet::new(),
+            complete_names: BTreeSet::new(),
+            blocked: Vec::new(),
+            conflicts: vec![UnownedConflict {
+                key: "pyg/note".to_owned(),
+                installed_name: "note".to_owned(),
+                message: unowned_conflict_message("pyg/note", "note", false),
+            }],
+        };
+        selection
+            .blocked
+            .push(selection.conflicts[0].message.clone());
+
+        assert!(!install_is_interactive());
+        resolve_unowned_overrides(&mut selection).unwrap();
+        assert!(selection.install_names.is_empty());
+        assert_eq!(selection.blocked.len(), 1);
+        assert_eq!(selection.conflicts.len(), 1);
     }
 
     #[test]
