@@ -1,3 +1,10 @@
+## [0.15.0] - 2026-09-16
+
+### Features
+
+- Report each skill's change in the install plan before mutation, distinguishing `new`, `update`, and `current` against the recorded digest baseline, with totals in the heading and a separate `Remove` list.
+- Show the pending update count in the interactive configuration header.
+
 ## [0.14.1] - 2026-09-16
 
 ### Changed

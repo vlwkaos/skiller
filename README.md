@@ -57,7 +57,9 @@ Interactive configuration restores the pre-Skiller selector geometry. Wide termi
 
 Enabled skills allow agent and human invocation. Manual skills are human-only unless required. Unselected dependencies are agent-only. Dependency reachability never changes configured selection.
 
-Every install prints an aligned plan before any projection mutation: one row per resolved skill, tree branches for dependency edges, and a colored state column showing `Agent + Human`, `Human only`, or `dependency`. Skill names are shown without their catalog prefix. A dependency that is also configured directly is annotated in the state column rather than repeated as a separate identity.
+Every install prints an aligned plan before any projection mutation: one row per resolved skill, tree branches for dependency edges, and two trailing columns for access (`Agent + Human`, `Human only`, or `dependency`) and change (`new`, `update`, or `current`). The heading carries the totals, and skills that are no longer desired are listed under a separate `Remove` heading. Skill names are shown without their catalog prefix, and a dependency that is also configured directly shows its configured mode.
+
+Catalog skills carry a content digest rather than a semantic version, so `update` means the authoritative content differs from the installed baseline. Interactive configuration reports the same pending updates in its header while catalogs are refreshed.
 
 ## Project reconciliation
 

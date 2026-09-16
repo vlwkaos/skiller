@@ -229,21 +229,34 @@ pub(crate) fn install_with_catalogs_recovery(
     validate_owned_state(&previous, paths.state_prefix)?;
     let active_manifest = manifest_without_unavailable(manifest, unavailable_aliases);
     let resolved = resolve_manifest(&active_manifest, catalogs, scope.is_global())?;
-    let plan = install_plan_rows(&active_manifest, catalogs, &resolved)?;
-    if plan.is_empty() {
+    let plan = install_plan(
+        &active_manifest,
+        catalogs,
+        &resolved,
+        &previous,
+        unavailable_aliases,
+    )?;
+    if plan.rows.is_empty() && plan.removals.is_empty() {
         println!("{}", output.info("Install plan"));
         println!("  (no configured skills)");
-    } else {
+    }
+    if !plan.rows.is_empty() {
+        println!("{}", output.info(&plan.heading()));
+        for line in render_install_plan(&plan.rows, output) {
+            println!("  {line}");
+        }
+    }
+    if !plan.removals.is_empty() {
         println!(
             "{}",
             output.info(&format!(
-                "Install plan  {} skill{}",
-                resolved.len(),
-                if resolved.len() == 1 { "" } else { "s" }
+                "Remove  {} skill{}",
+                plan.removals.len(),
+                if plan.removals.len() == 1 { "" } else { "s" }
             ))
         );
-        for line in render_install_plan(&plan, output) {
-            println!("  {line}");
+        for name in &plan.removals {
+            println!("  {}", output.tone(name, crate::output::Tone::Muted));
         }
     }
     let mut effective_replacement_owned = replacement_owned.clone();
@@ -796,13 +809,68 @@ struct InstallPlanRow {
     branch: String,
     name: String,
     state: InstallPlanState,
+    change: InstallPlanChange,
+}
+
+/// What installing this row will do, derived from the recorded digest baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallPlanChange {
+    New,
+    Update,
+    Current,
+}
+
+impl InstallPlanChange {
+    fn label(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::Update => "update",
+            Self::Current => "current",
+        }
+    }
+
+    fn tone(self) -> crate::output::Tone {
+        match self {
+            Self::New => crate::output::Tone::Success,
+            Self::Update => crate::output::Tone::Warning,
+            Self::Current => crate::output::Tone::Muted,
+        }
+    }
+}
+
+struct InstallPlan {
+    rows: Vec<InstallPlanRow>,
+    removals: Vec<String>,
+}
+
+impl InstallPlan {
+    /// Counts every installed skill once, then the non-zero change totals.
+    fn heading(&self) -> String {
+        let count = |change| self.rows.iter().filter(|row| row.change == change).count();
+        let mut parts = vec![format!(
+            "{} skill{}",
+            self.rows.len(),
+            if self.rows.len() == 1 { "" } else { "s" }
+        )];
+        let new_count = count(InstallPlanChange::New);
+        if new_count > 0 {
+            parts.push(format!("{new_count} new"));
+        }
+        let updates = count(InstallPlanChange::Update);
+        if updates > 0 {
+            parts.push(format!(
+                "{updates} update{}",
+                if updates == 1 { "" } else { "s" }
+            ));
+        }
+        format!("Install plan  {}", parts.join("  "))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallPlanState {
     Configured(SelectionMode),
     Dependency,
-    ConfiguredDependency(SelectionMode),
 }
 
 impl InstallPlanState {
@@ -810,33 +878,52 @@ impl InstallPlanState {
         match self {
             Self::Configured(mode) => selection_mode_label(mode).to_owned(),
             Self::Dependency => "dependency".to_owned(),
-            Self::ConfiguredDependency(mode) => {
-                format!("dependency, also configured {}", selection_mode_label(mode))
-            }
         }
     }
 
     fn tone(self) -> crate::output::Tone {
         match self {
-            Self::Configured(SelectionMode::Enable)
-            | Self::ConfiguredDependency(SelectionMode::Enable) => crate::output::Tone::Success,
-            Self::Configured(SelectionMode::Manual)
-            | Self::ConfiguredDependency(SelectionMode::Manual) => crate::output::Tone::Warning,
+            Self::Configured(SelectionMode::Enable) => crate::output::Tone::Success,
+            Self::Configured(SelectionMode::Manual) => crate::output::Tone::Warning,
             Self::Dependency => crate::output::Tone::Muted,
         }
     }
 }
 
+/// A skill is `update` when its recorded identity, mode, or digest differs.
+fn install_change(previous: &InstalledState, skill: &ResolvedSkill<'_>) -> InstallPlanChange {
+    match previous.skills.get(&skill.key) {
+        None => InstallPlanChange::New,
+        Some(installed)
+            if installed.installed_name != skill.installed_name
+                || installed.mode != skill.mode
+                || installed.gitignore != skill.gitignore
+                || installed.digest.as_deref() != Some(skill.digest.as_str()) =>
+        {
+            InstallPlanChange::Update
+        }
+        Some(_) => InstallPlanChange::Current,
+    }
+}
+
 // ^ README.md#configuration documents the install plan shown before projection mutation.
-fn install_plan_rows(
+fn install_plan(
     manifest: &ProjectConfig,
     catalogs: &BTreeMap<String, CatalogIndex>,
     resolved: &[ResolvedSkill<'_>],
-) -> Result<Vec<InstallPlanRow>> {
+    previous: &InstalledState,
+    unavailable_aliases: &BTreeSet<String>,
+) -> Result<InstallPlan> {
     let resolved_by_key: BTreeMap<_, _> = resolved
         .iter()
         .map(|skill| (skill.key.as_str(), skill))
         .collect();
+    let context = PlanContext {
+        manifest,
+        catalogs,
+        resolved: &resolved_by_key,
+        previous,
+    };
     let mut rows = Vec::new();
     for (key, selection) in &manifest.skills {
         let Some(root) = resolved_by_key.get(key.as_str()) else {
@@ -846,57 +933,65 @@ fn install_plan_rows(
             branch: String::new(),
             name: root.installed_name.clone(),
             state: InstallPlanState::Configured(selection.mode()),
+            change: install_change(previous, root),
         });
-        append_dependency_rows(
-            &root.key,
-            root,
-            "",
-            manifest,
-            catalogs,
-            &resolved_by_key,
-            &mut rows,
-        )?;
+        append_dependency_rows(&context, &root.key, root, "", &mut rows)?;
     }
-    Ok(rows)
+    let removals = previous
+        .skills
+        .iter()
+        .filter(|(key, _)| {
+            !key_alias(key).is_some_and(|alias| unavailable_aliases.contains(alias))
+                && !resolved_by_key.contains_key(key.as_str())
+        })
+        .map(|(_, skill)| skill.installed_name.clone())
+        .collect();
+    Ok(InstallPlan { rows, removals })
+}
+
+/// Read-only inputs shared by every recursion step.
+struct PlanContext<'a, 'c> {
+    manifest: &'a ProjectConfig,
+    catalogs: &'a BTreeMap<String, CatalogIndex>,
+    resolved: &'a BTreeMap<&'a str, &'a ResolvedSkill<'c>>,
+    previous: &'a InstalledState,
 }
 
 fn append_dependency_rows(
+    context: &PlanContext<'_, '_>,
     parent_key: &str,
     parent: &ResolvedSkill<'_>,
     prefix: &str,
-    manifest: &ProjectConfig,
-    catalogs: &BTreeMap<String, CatalogIndex>,
-    resolved: &BTreeMap<&str, &ResolvedSkill<'_>>,
     rows: &mut Vec<InstallPlanRow>,
 ) -> Result<()> {
     let (alias, _) = split_key(parent_key)?;
-    let catalog = catalogs
+    let catalog = context
+        .catalogs
         .get(alias)
         .with_context(|| format!("configuration references unregistered catalog: {alias}"))?;
     let dependencies: Vec<_> = catalog.skills[&parent.source_name]
         .requires
         .iter()
         .map(|name| format!("{alias}/{name}"))
-        .filter(|key| resolved.contains_key(key.as_str()))
+        .filter(|key| context.resolved.contains_key(key.as_str()))
         .collect();
     for (index, dependency_key) in dependencies.iter().enumerate() {
         let last = index + 1 == dependencies.len();
-        let child = resolved[dependency_key.as_str()];
+        let child = context.resolved[dependency_key.as_str()];
         rows.push(InstallPlanRow {
             branch: format!("{prefix}{}", if last { "└─ " } else { "├─ " }),
             name: child.installed_name.clone(),
-            state: match manifest.skills.get(dependency_key) {
-                Some(selection) => InstallPlanState::ConfiguredDependency(selection.mode()),
+            state: match context.manifest.skills.get(dependency_key) {
+                Some(selection) => InstallPlanState::Configured(selection.mode()),
                 None => InstallPlanState::Dependency,
             },
+            change: install_change(context.previous, child),
         });
         append_dependency_rows(
+            context,
             dependency_key,
             child,
             &format!("{prefix}{}", if last { "   " } else { "│  " }),
-            manifest,
-            catalogs,
-            resolved,
             rows,
         )?;
     }
@@ -910,16 +1005,23 @@ fn render_install_plan(rows: &[InstallPlanRow], output: crate::output::HumanOutp
         .iter()
         .map(|row| format!("{}{}", row.branch, row.name))
         .collect();
+    let states: Vec<_> = rows.iter().map(|row| row.state.label()).collect();
     let width = labels.iter().map(|label| label.width()).max().unwrap_or(0);
+    let state_width = states.iter().map(|state| state.width()).max().unwrap_or(0);
     labels
         .into_iter()
+        .zip(states)
         .zip(rows)
-        .map(|(label, row)| {
-            let padding = width.saturating_sub(label.width());
+        .map(|((label, state), row)| {
+            let state = format!(
+                "{state}{}",
+                " ".repeat(state_width.saturating_sub(state.width()))
+            );
             format!(
-                "{label}{}  {}",
-                " ".repeat(padding),
-                output.tone(&row.state.label(), row.state.tone())
+                "{label}{}  {}  {}",
+                " ".repeat(width.saturating_sub(label.width())),
+                output.tone(&state, row.state.tone()),
+                output.tone(row.change.label(), row.change.tone())
             )
         })
         .collect()
@@ -1837,41 +1939,53 @@ mod tests {
             agents: crate::model::default_agents(),
         };
         let resolved = resolve_manifest(&manifest, &catalogs, true).unwrap();
-        let rows = install_plan_rows(&manifest, &catalogs, &resolved).unwrap();
+        let plan = install_plan(
+            &manifest,
+            &catalogs,
+            &resolved,
+            &InstalledState::default(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert_eq!(
-            rows,
+            plan.rows,
             vec![
                 InstallPlanRow {
                     branch: String::new(),
                     name: "dependency".to_owned(),
                     state: InstallPlanState::Configured(SelectionMode::Manual),
+                    change: InstallPlanChange::New,
                 },
                 InstallPlanRow {
                     branch: String::new(),
                     name: "root".to_owned(),
                     state: InstallPlanState::Configured(SelectionMode::Enable),
+                    change: InstallPlanChange::New,
                 },
                 InstallPlanRow {
                     branch: "└─ ".to_owned(),
                     name: "dependency".to_owned(),
-                    state: InstallPlanState::ConfiguredDependency(SelectionMode::Manual),
+                    state: InstallPlanState::Configured(SelectionMode::Manual),
+                    change: InstallPlanChange::New,
                 },
             ]
         );
+        assert!(plan.removals.is_empty());
+        assert_eq!(plan.heading(), "Install plan  3 skills  3 new");
 
-        // Names drop the repeated catalog prefix and states align in one column.
-        let rendered = render_install_plan(&rows, crate::output::HumanOutput::plain());
+        // Names drop the repeated catalog prefix, and states and changes align.
+        let rendered = render_install_plan(&plan.rows, crate::output::HumanOutput::plain());
         assert_eq!(
             rendered,
             vec![
-                "dependency     Human only",
-                "root           Agent + Human",
-                "└─ dependency  dependency, also configured Human only",
+                "dependency     Human only     new",
+                "root           Agent + Human  new",
+                "└─ dependency  Human only     new",
             ]
         );
         assert!(rendered.iter().all(|line| !line.contains("pyg/")));
         assert!(
-            render_install_plan(&rows, crate::output::HumanOutput::styled())
+            render_install_plan(&plan.rows, crate::output::HumanOutput::styled())
                 .iter()
                 .all(|line| line.contains('\u{1b}'))
         );
@@ -1889,11 +2003,92 @@ mod tests {
             agents: crate::model::default_agents(),
         };
         let resolved = resolve_manifest(&manifest, &catalogs, false).unwrap();
-        let rows = install_plan_rows(&manifest, &catalogs, &resolved).unwrap();
+        let plan = install_plan(
+            &manifest,
+            &catalogs,
+            &resolved,
+            &InstalledState::default(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
         assert_eq!(
-            render_install_plan(&rows, crate::output::HumanOutput::plain()),
-            vec!["root           Agent + Human", "└─ dependency  dependency"]
+            render_install_plan(&plan.rows, crate::output::HumanOutput::plain()),
+            vec![
+                "root           Agent + Human  new",
+                "└─ dependency  dependency     new",
+            ]
         );
+    }
+
+    #[test]
+    fn install_plan_reports_updates_and_removals_from_recorded_state() {
+        let catalogs = BTreeMap::from([("pyg".to_owned(), catalog(false))]);
+        let manifest = ProjectConfig {
+            version: SCHEMA_VERSION,
+            skills: BTreeMap::from([(
+                "pyg/root".to_owned(),
+                SkillSelection::Mode(SelectionMode::Enable),
+            )]),
+            agents: crate::model::default_agents(),
+        };
+        let resolved = resolve_manifest(&manifest, &catalogs, false).unwrap();
+        // The recorded baseline is the projected digest the resolver produces.
+        let current_digest = resolved
+            .iter()
+            .find(|skill| skill.key == "pyg/root")
+            .unwrap()
+            .digest
+            .clone();
+        let installed = |name: &str, mode: EffectiveMode, digest: String| InstalledSkill {
+            installed_name: name.to_owned(),
+            mode,
+            gitignore: false,
+            digest: Some(digest),
+            content_digest: None,
+            legacy_path: None,
+        };
+        let previous = InstalledState {
+            version: INSTALLED_STATE_VERSION,
+            skills: BTreeMap::from([
+                (
+                    "pyg/root".to_owned(),
+                    installed("root", EffectiveMode::Enable, current_digest),
+                ),
+                (
+                    "pyg/dependency".to_owned(),
+                    installed("dependency", EffectiveMode::Dependency, "stale".to_owned()),
+                ),
+                (
+                    "pyg/memo".to_owned(),
+                    installed("memo", EffectiveMode::Enable, "memo".to_owned()),
+                ),
+            ]),
+        };
+        let plan =
+            install_plan(&manifest, &catalogs, &resolved, &previous, &BTreeSet::new()).unwrap();
+        assert_eq!(plan.heading(), "Install plan  2 skills  1 update");
+        assert_eq!(plan.removals, vec!["memo".to_owned()]);
+        assert_eq!(
+            plan.rows
+                .iter()
+                .map(|row| (row.name.as_str(), row.change))
+                .collect::<Vec<_>>(),
+            vec![
+                ("root", InstallPlanChange::Current),
+                ("dependency", InstallPlanChange::Update),
+            ]
+        );
+
+        // An unavailable catalog keeps its recorded skills out of the removal list.
+        let plan = install_plan(
+            &manifest,
+            &catalogs,
+            &resolved,
+            &previous,
+            &BTreeSet::from(["pyg".to_owned()]),
+        )
+        .unwrap();
+        assert!(plan.removals.is_empty());
     }
 
     #[test]

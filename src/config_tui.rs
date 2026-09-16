@@ -529,8 +529,18 @@ fn view_lines(
     let header_height = usize::from(height >= 4) + 1;
     let body_height = height.saturating_sub(header_height + usize::from(show_footer));
     let attention = rows.iter().filter(|row| sync_attention(row)).count();
+    // ^ A catalog content change surfaces as `Incoming`, so the header states the count before install.
+    let updates = rows
+        .iter()
+        .filter(|row| row.sync == Some(crate::installer::ProjectionStatus::Incoming))
+        .count();
+    let update_note = if updates == 0 {
+        String::new()
+    } else {
+        format!(" · {updates} update{}", if updates == 1 { "" } else { "s" })
+    };
     let summary = format!(
-        "{} scopes · {} skills · {} configured · {attention} attention",
+        "{} scopes · {} skills · {} configured · {attention} attention{update_note}",
         groups.len(),
         rows.len(),
         manifest.skills.len()
@@ -1367,6 +1377,33 @@ mod tests {
             segment_color("└─ +3 more", state(ConfigScreen::Skills, 0, 0)),
             Some(crate::output::MUTED)
         );
+    }
+
+    #[test]
+    fn header_reports_available_updates_before_install() {
+        let mut pending = row("develop", "engineering", true);
+        pending.sync = Some(crate::installer::ProjectionStatus::Incoming);
+        let rendered = view_lines(
+            std::slice::from_ref(&pending),
+            &ProjectConfig::default(),
+            true,
+            state(ConfigScreen::Scopes, 0, 0),
+            100,
+            18,
+        )
+        .join("\n");
+        assert!(rendered.contains("1 update"));
+
+        let current = view_lines(
+            &[row("develop", "engineering", true)],
+            &ProjectConfig::default(),
+            true,
+            state(ConfigScreen::Scopes, 0, 0),
+            100,
+            18,
+        )
+        .join("\n");
+        assert!(!current.contains("update"));
     }
 
     #[test]
